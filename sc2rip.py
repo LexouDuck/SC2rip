@@ -33,6 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
+CONVERTER_VERSION = '2'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -337,7 +338,9 @@ def main():
     out.add_argument('--anim-sampling', type=int, default=1, help='sample every N frames (30 fps base)')
     out.add_argument('--normal-maps', default='raw', choices=['raw', 'rgb'],
                      help="raw: keep SC2's DXT5nm layout; rgb: rebuild a standard RGB normal map")
-    out.add_argument('--save-blend', action='store_true', help='also save a .blend next to each .dae')
+    out.add_argument('--save-blend', action='store_true',
+                     help='also save a ready-to-view .blend next to each .dae')
+    out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl files next to the .dae files")
     out.add_argument('--keep-empty', action='store_true', help='export models that have no geometry')
     tools = ap.add_argument_group('tools')
     tools.add_argument('--blender', help='Blender 4.5 LTS executable (5.x has no COLLADA)')
@@ -355,6 +358,9 @@ def main():
 
     args.categories = [c.strip().lower() for c in args.categories.split(',') if c.strip()]
     args.sources = [s.strip().lower() for s in args.sources.split(',') if s.strip()]
+    # absolute paths everywhere: Blender stores texture paths in .blend files and must be able to
+    # make them relative to the .blend, not to the folder sc2rip was started from
+    args.out = os.path.abspath(args.out)
     os.makedirs(args.out, exist_ok=True)
     work = os.path.abspath(args.work or os.path.join(args.out, '_work'))
     os.makedirs(work, exist_ok=True)
@@ -423,7 +429,7 @@ def main():
     try:
         import PIL  # noqa: F401
     except ImportError:
-        raise SystemExit('Pillow is required for DDS -> PNG conversion: python -m pip install pillow')
+        raise SystemExit('Pillow is required for DDS -> PNG conversion: python3 -m pip install pillow')
     m3studio = ensure_m3studio(args, log)
     prefix, bl_version = converter_command(args)
     log(f'Using Blender {bl_version}, M3Studio at {m3studio}')
@@ -559,7 +565,18 @@ def main():
 
     # ---- 4. convert
     options = {'anim_mode': args.anim_mode, 'sampling_rate': args.anim_sampling,
-               'save_blend': args.save_blend, 'skip_empty': not args.keep_empty, 'animations': True}
+               'save_blend': args.save_blend, 'skip_empty': not args.keep_empty, 'animations': True,
+               'obj': not args.no_obj, 'normal_maps': args.normal_maps,
+               'converter_version': CONVERTER_VERSION, 'blender_version': bl_version}
+
+    def expected_outputs(m):
+        base = os.path.splitext(m['dae'])[0]
+        outs = [m['dae']]
+        if options['obj']:
+            outs += [base + '.obj', base + '.mtl']
+        if options['save_blend']:
+            outs.append(base + '.blend')
+        return outs
 
     def run_job(job):
         out_folder = job['out_folder']
@@ -573,18 +590,28 @@ def main():
         jid = hashlib.sha1(job['folder'].encode()).hexdigest()[:12]
         jpath = os.path.join(job_dir, jid + '.json')
         rpath = os.path.join(job_dir, jid + '.result.json')
-        if not args.force and os.path.isfile(rpath):
+        job_data = {'m3studio': m3studio, 'models': job['models'], 'textures': textures_out,
+                    'options': options, 'result': rpath}
+        # reuse a previous result only if it was produced from exactly the same job (same models,
+        # textures, options and converter version) and every expected output file still exists
+        if not args.force and os.path.isfile(rpath) and os.path.isfile(jpath):
             try:
+                with open(jpath, encoding='utf-8') as f:
+                    prev_job = json.load(f)
                 with open(rpath, encoding='utf-8') as f:
                     prev = json.load(f)
-                if all(r.get('ok') for r in prev['models']) and \
-                        all(os.path.isfile(m['dae']) or r.get('skipped') for m, r in zip(job['models'], prev['models'])):
+                same = json.dumps(prev_job, sort_keys=True) == json.dumps(job_data, sort_keys=True)
+                complete = len(prev['models']) == len(job['models']) and all(
+                    r.get('skipped') or (r.get('ok') and all(os.path.isfile(p) for p in expected_outputs(m)))
+                    for m, r in zip(job['models'], prev['models']))
+                if same and complete:
                     return job, prev, 'cached'
             except Exception:
                 pass
+        if os.path.isfile(rpath):
+            os.remove(rpath)
         with open(jpath, 'w', encoding='utf-8') as f:
-            json.dump({'m3studio': m3studio, 'models': job['models'], 'textures': textures_out,
-                       'options': options, 'result': rpath}, f, indent=1)
+            json.dump(job_data, f, indent=1)
         logpath = os.path.join(job_dir, jid + '.log')
         try:
             with open(logpath, 'w', encoding='utf-8', errors='replace') as lf:

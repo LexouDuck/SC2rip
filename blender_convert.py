@@ -168,7 +168,9 @@ def collect_layers(ob, m3mat, shared):
 def load_image(png_path, non_color=False):
     if not png_path or not os.path.isfile(png_path):
         return None
-    img = bpy.data.images.load(png_path, check_existing=True)
+    img = bpy.data.images.load(os.path.abspath(png_path), check_existing=True)
+    # SC2 alpha channels hold data (team-colour mask, normal X), not transparency
+    img.alpha_mode = 'CHANNEL_PACKED'
     if non_color:
         try:
             img.colorspace_settings.name = 'Non-Color'
@@ -177,7 +179,63 @@ def load_image(png_path, non_color=False):
     return img
 
 
-def build_blender_material(name, layers, tex_map, report):
+def sc2_normal_decode_group():
+    """Node group turning an SC2 DXT5nm texture (X in alpha, Y in green) into a standard
+    tangent-space normal colour. 'Flip Green' switches between OpenGL/DirectX Y conventions."""
+    name = 'SC2 Normal Decode (DXT5nm)'
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
+    iface = ng.interface
+    iface.new_socket('Color', in_out='INPUT', socket_type='NodeSocketColor')
+    iface.new_socket('Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
+    flip = iface.new_socket('Flip Green', in_out='INPUT', socket_type='NodeSocketFloat')
+    flip.default_value, flip.min_value, flip.max_value = 0.0, 0.0, 1.0
+    iface.new_socket('Normal Color', in_out='OUTPUT', socket_type='NodeSocketColor')
+    N, L = ng.nodes, ng.links
+    gin, gout = N.new('NodeGroupInput'), N.new('NodeGroupOutput')
+    gin.location, gout.location = (-900, 0), (700, 0)
+    sep = N.new('ShaderNodeSeparateColor'); sep.location = (-700, 100)
+    L.new(gin.outputs['Color'], sep.inputs['Color'])
+
+    def math(op, a, b=None, loc=(0, 0), clamp=False):
+        n = N.new('ShaderNodeMath'); n.operation = op; n.location = loc; n.use_clamp = clamp
+        for i, v in enumerate((a, b)):
+            if v is None:
+                continue
+            if isinstance(v, (int, float)):
+                n.inputs[i].default_value = v
+            else:
+                L.new(v, n.inputs[i])
+        return n.outputs[0]
+
+    # green, optionally flipped: g' = g + flip * (1 - 2g)
+    g = sep.outputs['Green']
+    one_minus_2g = math('MULTIPLY_ADD', g, -2.0, loc=(-500, -150))      # g * -2 + 1
+    one_minus_2g.node.inputs[2].default_value = 1.0
+    g_flip = math('ADD', g, math('MULTIPLY', gin.outputs['Flip Green'], one_minus_2g, loc=(-300, -100)),
+                  loc=(-100, 0))
+    # to [-1, 1]: v * 2 - 1
+    x = math('MULTIPLY_ADD', gin.outputs['Alpha'], 2.0, loc=(150, 250))
+    x.node.inputs[2].default_value = -1.0
+    y = math('MULTIPLY_ADD', g_flip, 2.0, loc=(150, 0))
+    y.node.inputs[2].default_value = -1.0
+    xx = math('MULTIPLY', x, x, loc=(300, 250))
+    yy = math('MULTIPLY', y, y, loc=(300, 0))
+    z = math('SQRT', math('SUBTRACT', math('SUBTRACT', 1.0, xx, loc=(450, 250)), yy, loc=(450, 100), clamp=True),
+             loc=(450, -50))
+    comb = N.new('ShaderNodeCombineColor'); comb.location = (550, 0)
+    for chan, v in (('Red', gin.outputs['Alpha']), ('Green', g_flip)):
+        L.new(v, comb.inputs[chan])
+    zc = math('MULTIPLY_ADD', z, 0.5, loc=(500, -200))
+    zc.node.inputs[2].default_value = 0.5
+    L.new(zc, comb.inputs['Blue'])
+    L.new(comb.outputs['Color'], gout.inputs['Normal Color'])
+    return ng
+
+
+def build_blender_material(name, layers, tex_map, report, normal_mode='raw'):
     """Create a Principled-BSDF material wired to the converted PNG textures."""
     mat = bpy.data.materials.get(name)
     if mat is not None:
@@ -232,8 +290,17 @@ def build_blender_material(name, layers, tex_map, report):
     norm = tex_node('normal', non_color=True, y=-900)
     if norm is not None:
         nmap = nt.nodes.new('ShaderNodeNormalMap')
-        nmap.location = (-250, -900)
-        nt.links.new(norm.outputs['Color'], nmap.inputs['Color'])
+        nmap.location = (-150, -900)
+        if normal_mode == 'raw':
+            # SC2 "DXT5nm" layout: X in alpha, Y in green, Z rebuilt - decode it in the shader
+            dec = nt.nodes.new('ShaderNodeGroup')
+            dec.node_tree = sc2_normal_decode_group()
+            dec.location = (-350, -900)
+            nt.links.new(norm.outputs['Color'], dec.inputs['Color'])
+            nt.links.new(norm.outputs['Alpha'], dec.inputs['Alpha'])
+            nt.links.new(dec.outputs['Normal Color'], nmap.inputs['Color'])
+        else:
+            nt.links.new(norm.outputs['Color'], nmap.inputs['Color'])
         nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
 
     # remaining layers: add unconnected image nodes so they are still visible in the .blend
@@ -573,6 +640,105 @@ def write_anim_list(path, model_name, clips, fps):
         f.write('\n'.join(lines) + '\n')
 
 
+def export_obj(path, meshes):
+    for o in bpy.data.objects:
+        o.select_set(False)
+    for m in meshes:
+        m.select_set(True)
+    bpy.context.view_layer.objects.active = meshes[0]
+    kwargs = dict(filepath=os.path.abspath(path), check_existing=False, export_selected_objects=True,
+                  apply_modifiers=False,          # ignore the armature: bind pose
+                  export_animation=False, export_uv=True, export_normals=True, export_colors=False,
+                  export_materials=True, export_pbr_extensions=False, path_mode='RELATIVE',
+                  export_triangulated_mesh=False, export_object_groups=False, export_material_groups=False,
+                  export_vertex_groups=False, forward_axis='NEGATIVE_Z', up_axis='Y')
+    props = bpy.ops.wm.obj_export.get_rna_type().properties.keys()
+    res = bpy.ops.wm.obj_export(**{k: v for k, v in kwargs.items() if k in props})
+    if 'FINISHED' not in res:
+        raise RuntimeError(f'obj_export returned {res}')
+    # Blender names the currently open .blend (an unrelated earlier model) in the MTL header
+    mtl = os.path.splitext(os.path.abspath(path))[0] + '.mtl'
+    if os.path.isfile(mtl):
+        with open(mtl, 'r', encoding='utf-8') as f:
+            lines = f.read().split('\n')
+        if lines and lines[0].startswith('# Blender'):
+            lines[0] = f'# Exported by sc2rip with Blender {bpy.app.version_string}'
+        with open(mtl, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+
+def setup_viewer(ob, meshes, clips, timeline_act):
+    """Make the saved .blend open ready to look at: Material Preview shading (HDRI lighting, so
+    normal/specular maps show), view framed on the model, a sun + world for Rendered mode, and the
+    animation timeline with one named marker per clip."""
+    from mathutils import Vector, Quaternion
+    sc = bpy.context.scene
+
+    # animation: the full timeline action + markers at each clip start
+    if timeline_act is not None:
+        ob.animation_data_create()
+        ob.animation_data.action = timeline_act
+        try:
+            if ob.animation_data.action_slot is None and len(timeline_act.slots):
+                ob.animation_data.action_slot = timeline_act.slots[0]
+        except AttributeError:
+            pass
+        sc.timeline_markers.clear()
+        for c in clips:
+            sc.timeline_markers.new(c['name'], frame=int(c['frame_start']))
+        sc.frame_start, sc.frame_end = 0, int(clips[-1]['frame_end'])
+    sc.frame_set(0)
+
+    # bounds of the model (evaluated at frame 0)
+    dg = bpy.context.evaluated_depsgraph_get()
+    pts = []
+    for m in meshes:
+        ev = m.evaluated_get(dg)
+        pts += [ev.matrix_world @ Vector(c) for c in ev.bound_box]
+    if pts:
+        lo = Vector((min(p.x for p in pts), min(p.y for p in pts), min(p.z for p in pts)))
+        hi = Vector((max(p.x for p in pts), max(p.y for p in pts), max(p.z for p in pts)))
+    else:
+        lo, hi = Vector((-1, -1, 0)), Vector((1, 1, 2))
+    center, radius = (lo + hi) / 2, max((hi - lo).length / 2, 0.1)
+
+    # lighting for Rendered mode (Material Preview uses its own studio HDRI)
+    sun = bpy.data.lights.new('SC2rip_Sun', 'SUN')
+    sun.energy = 3.0
+    sun_ob = bpy.data.objects.new('SC2rip_Sun', sun)
+    sc.collection.objects.link(sun_ob)
+    sun_ob.rotation_euler = (0.8, 0.0, 0.6)
+    world = sc.world or bpy.data.worlds.new('World')
+    sc.world = world
+    world.use_nodes = True
+    bg = next((n for n in world.node_tree.nodes if n.type == 'BACKGROUND'), None)
+    if bg is not None:
+        bg.inputs['Color'].default_value = (0.25, 0.25, 0.27, 1.0)
+        bg.inputs['Strength'].default_value = 1.0
+    try:
+        sc.view_settings.view_transform = 'Standard'   # true-to-texture colours
+    except TypeError:
+        pass
+
+    # every 3D viewport: Material Preview, framed on the model from a 3/4 angle
+    view_rot = Quaternion((0.0, 0.0, 1.0), 0.6) @ Quaternion((1.0, 0.0, 0.0), 1.15)
+    for screen in bpy.data.screens:
+        for area in screen.areas:
+            if area.type != 'VIEW_3D':
+                continue
+            for space in area.spaces:
+                if space.type != 'VIEW_3D':
+                    continue
+                space.shading.type = 'MATERIAL'
+                space.clip_end = max(space.clip_end, radius * 50)
+                r3d = space.region_3d
+                if r3d is not None:
+                    r3d.view_location = center
+                    r3d.view_distance = radius * 3.0
+                    r3d.view_rotation = view_rot
+                    r3d.view_perspective = 'PERSP'
+
+
 # --------------------------------------------------------------------------------------
 # Per-model conversion
 # --------------------------------------------------------------------------------------
@@ -644,7 +810,8 @@ def convert_model(m3s, model, tex_map, opts):
         mat_name = matref.name if matref else f'{model_stem}_NoMaterial'
         if mat_name not in mat_cache:
             layers = collect_layers(ob, m3mat, shared)
-            mat_cache[mat_name] = build_blender_material(mat_name, layers, tex_map, report)
+            mat_cache[mat_name] = build_blender_material(mat_name, layers, tex_map, report,
+                                                          opts.get('normal_maps', 'raw'))
         mob.data.materials.clear()
         mob.data.materials.append(mat_cache[mat_name])
 
@@ -677,6 +844,7 @@ def convert_model(m3s, model, tex_map, opts):
 
     # 1) main file: all sequences laid out end to end on one timeline
     clips = []
+    timeline_act = None
     if sequences and anim_mode in ('timeline', 'both'):
         placed, off = [], 0
         for seq in sequences:
@@ -685,6 +853,7 @@ def convert_model(m3s, model, tex_map, opts):
                           'looping': seq['looping'], 'source_frames': seq['source_frames']})
             off += seq['length'] + gap
         act = build_action(model_stem + '_AllAnimations', defaults, placed)
+        timeline_act = act
         assign_action(ob, act, 0, clips[-1]['frame_end'])
         export_collada(model['dae'], opts, False)
         inject_animations(model['dae'], ob, 0, clips[-1]['frame_end'], fps, opts.get('sampling_rate', 1))
@@ -716,9 +885,20 @@ def convert_model(m3s, model, tex_map, opts):
 
     report['animations'] = clips
 
+    # 3) Wavefront OBJ + MTL (static mesh in its bind pose; OBJ has no skeleton/animation)
+    if opts.get('obj', True):
+        export_obj(os.path.splitext(model['dae'])[0] + '.obj', region_meshes)
+
     if opts.get('save_blend'):
-        bpy.ops.wm.save_as_mainfile(filepath=os.path.splitext(model['dae'])[0] + '.blend',
-                                    check_existing=False, compress=True)
+        setup_viewer(ob, region_meshes, clips if timeline_act else [], timeline_act)
+        blend_path = os.path.abspath(os.path.splitext(model['dae'])[0] + '.blend')
+        # store texture paths relative to the .blend ("//Foo.png") so the folder can be moved/shared
+        for img in bpy.data.images:
+            if img.filepath and not img.filepath.startswith('//'):
+                img.filepath = '//' + os.path.relpath(os.path.abspath(img.filepath),
+                                                      os.path.dirname(blend_path)).replace(os.sep, '/')
+        bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False, compress=True,
+                                    relative_remap=True)
 
     report['ok'] = True
     report['seconds'] = round(time.time() - t0, 2)
