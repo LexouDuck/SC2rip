@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
-CONVERTER_VERSION = '6'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '7'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -299,12 +299,14 @@ def dds_to_png(data, out_path, normal_mode='raw', is_normal=False):
     im.load()
     if im.mode not in ('RGBA', 'RGB', 'L', 'LA'):
         im = im.convert('RGBA')
-    if is_normal and normal_mode == 'rgb' and im.mode == 'RGBA':
+    if is_normal and normal_mode == 'rgb':
         try:
             import numpy as np
-            a = np.asarray(im).astype('float32') / 255.0
-            x = a[..., 3] * 2 - 1          # SC2 stores X in alpha ("DXT5nm")
-            y = 1 - a[..., 1] * 2          # ... and Y DirectX-style: flip to OpenGL / Blender
+            a = np.asarray(im.convert('RGBA')).astype('float32') / 255.0
+            # SC2 uses packed "DXT5nm" maps (X in alpha, blue unused) and plain RGB maps (blue = Z)
+            plain = a[..., 2].mean() > 0.6 and a[..., 3].std() < 0.02
+            x = (a[..., 0] if plain else a[..., 3]) * 2 - 1
+            y = 1 - a[..., 1] * 2          # SC2 is DirectX-style (green down): flip to OpenGL / Blender
             z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
             rgb = np.stack([(x + 1) / 2, (y + 1) / 2, (z + 1) / 2], -1)
             im = Image.fromarray((rgb * 255 + 0.5).astype('uint8'), 'RGB')

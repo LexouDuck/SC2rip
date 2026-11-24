@@ -613,6 +613,29 @@ def postprocess_dae(dae_path, clips=None, fps=30, material_info=None):
             if diff_tex is None:
                 continue
             attrs = {'texture': diff_tex.get('texture'), 'texcoord': diff_tex.get('texcoord', 'UVMap')}
+            emis_attrs = attrs
+            if info.get('emission_file'):
+                # a separate glow texture: declare image + surface + sampler for it
+                img_id = ncname(os.path.splitext(info['emission_file'])[0]) + '_emission_png'
+                lib_images = root.find('c:library_images', ns)
+                if lib_images is None:
+                    lib_images = ET.Element(q('library_images'))
+                    root.insert(list(root).index(root.find('c:library_effects', ns)), lib_images)
+                if lib_images.find(f"c:image[@id='{img_id}']", ns) is None:
+                    im = ET.SubElement(lib_images, q('image'), {'id': img_id, 'name': img_id})
+                    ET.SubElement(im, q('init_from')).text = info['emission_file']
+                prof = eff.find('c:profile_COMMON', ns)
+                first_tech = prof.find('c:technique', ns)
+                pos = list(prof).index(first_tech)
+                surf = ET.Element(q('newparam'), {'sid': img_id + '-surface'})
+                se = ET.SubElement(surf, q('surface'), {'type': '2D'})
+                ET.SubElement(se, q('init_from')).text = img_id
+                samp = ET.Element(q('newparam'), {'sid': img_id + '-sampler'})
+                sa = ET.SubElement(samp, q('sampler2D'))
+                ET.SubElement(sa, q('source')).text = img_id + '-surface'
+                prof.insert(pos, surf)
+                prof.insert(pos + 1, samp)
+                emis_attrs = {'texture': img_id + '-sampler', 'texcoord': attrs['texcoord']}
             if info.get('glow'):
                 em = shading.find('c:emission', ns)
                 if em is None:
@@ -620,7 +643,7 @@ def postprocess_dae(dae_path, clips=None, fps=30, material_info=None):
                     shading.insert(0, em)
                 for c in list(em):
                     em.remove(c)
-                ET.SubElement(em, q('texture'), attrs)
+                ET.SubElement(em, q('texture'), emis_attrs)
             if info.get('alpha'):
                 for tag in ('transparent', 'transparency'):
                     old_el = shading.find(f'c:{tag}', ns)
@@ -812,22 +835,39 @@ def setup_viewer(ob, meshes, clips, timeline_act):
 
     # team colour + global strengths: custom properties on the scene, read by every material
     # (Scene Properties tab > Custom Properties)
-    for key, default, ui in sm.SCENE_SETTINGS:
-        sc[key] = default
-        sc.id_properties_ui(key).update(**ui)
 
     # lighting for Rendered mode (Material Preview uses its own studio HDRI)
     sun = bpy.data.lights.new('Light', 'SUN')
     sun.energy = 3.0
     sun_ob = bpy.data.objects.new('Light', sun)
     sc.collection.objects.link(sun_ob)
-    sun_ob.rotation_euler = (0.8, 0.0, 0.6)
+    sun_ob.rotation_euler = sm.SUN_EULER
+    bpy.context.view_layer.update()
+
+    # team colour, strengths and sun direction: custom properties on the scene, read by every
+    # material (Scene Properties tab > Custom Properties)
+    for key, default, ui in sm.SCENE_SETTINGS:
+        if key == 'sun_direction':
+            default = tuple(sun_ob.matrix_world.col[2][:3])     # the sun lamp shines along its -Z
+        sc[key] = default
+        sc.id_properties_ui(key).update(**ui)
+    # keep sun_direction in step with the lamp: rotating "Light" moves the highlights
+    for i in range(3):
+        fc = sc.driver_add('["sun_direction"]', i)
+        drv = fc.driver
+        drv.type = 'AVERAGE'
+        var = drv.variables.new()
+        var.name = 'v'
+        var.type = 'SINGLE_PROP'
+        var.targets[0].id_type = 'OBJECT'
+        var.targets[0].id = sun_ob
+        var.targets[0].data_path = f'matrix_world[{i}][2]'
     world = sc.world or bpy.data.worlds.new('World')
     sc.world = world
     world.use_nodes = True
     bg = next((n for n in world.node_tree.nodes if n.type == 'BACKGROUND'), None)
     if bg is not None:
-        bg.inputs['Color'].default_value = (0.25, 0.25, 0.27, 1.0)
+        bg.inputs['Color'].default_value = (0.4, 0.4, 0.42, 1.0)   # SC2 scenes have strong ambient light
         bg.inputs['Strength'].default_value = 1.0
     try:
         sc.view_settings.view_transform = 'Standard'   # true-to-texture colours
@@ -894,6 +934,11 @@ def convert_model(m3s, model, tex_map, opts):
 
     defaults, sequences, layer_defaults, vis_defaults = collect_sequences(ob) if get_anims else ({}, [], {}, {})
     animated_paths = {k[0] for seq in sequences for k in seq['mat_channels']}
+    anim_peaks = {}      # animated scalar material property -> strongest value it reaches
+    for seq in sequences:
+        for (path, idx), pts in seq['mat_channels'].items():
+            if idx == 0 and pts:
+                anim_peaks[path] = max(anim_peaks.get(path, float('-inf')), max(v for _, v, _ in pts))
     normal_mode = opts.get('normal_maps', 'raw')
 
     model_stem = os.path.splitext(os.path.basename(model['dae']))[0]
@@ -949,7 +994,7 @@ def convert_model(m3s, model, tex_map, opts):
         plan = sm.export_plan(layers, m3mat, mtype)
         if mat_name not in mat_cache:
             mat_cache[mat_name], export_info[mat_name] = sm.build_export_material(
-                mat_name, plan, tex_map, report, out_dir, layers.get('normal'), normal_mode)
+                mat_name, plan, tex_map, report, out_dir, layers.get('normal'), normal_mode, anim_peaks)
         mob.data.materials.clear()
         mob.data.materials.append(mat_cache[mat_name])
         mesh_materials.append((mob, mat_name, m3mat, layers, mtype))

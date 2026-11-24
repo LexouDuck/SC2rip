@@ -62,7 +62,10 @@ SCENE_SETTINGS = [
     ('emission_strength', 1.0, dict(min=0.0, soft_max=4.0, description='Multiplier on emissive glow')),
     ('distortion_visibility', 0.15, dict(min=0.0, soft_max=2.0,
                                           description='How visible distortion effects (warp shimmer, heat haze) are')),
+    ('sun_direction', None, dict(subtype='DIRECTION', description='Direction towards the sun, used for '
+                                 'specular highlights. Driven by the "Light" object')),
 ]
+SUN_EULER = (0.7, 0.0, 0.3)    # rotation of the "Light" sun lamp: from the front-top, like the default view
 
 
 def norm_tex_key(path):
@@ -167,9 +170,10 @@ def _math(nt, op, a, b=None, loc=(0, 0), clamp=False, c=None):
 
 
 def sc2_normal_decode_group():
-    """SC2 "DXT5nm" normal texture (X in alpha, Y in green) -> standard tangent-space normal colour.
+    """SC2 normal texture -> standard (OpenGL-convention) tangent-space normal colour.
+    'Packed (DXT5nm)' = 1: X is in the alpha channel, Y in green, Z rebuilt; 0: plain RGB normal map.
     SC2 normal maps are DirectX-style (green points down), so 'Flip Green' defaults to 1."""
-    name = 'SC2 Normal Decode (DXT5nm)'
+    name = 'SC2 Normal Decode'
     ng = bpy.data.node_groups.get(name)
     if ng is not None:
         return ng
@@ -179,6 +183,8 @@ def sc2_normal_decode_group():
     iface.new_socket('Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
     flip = iface.new_socket('Flip Green', in_out='INPUT', socket_type='NodeSocketFloat')
     flip.default_value, flip.min_value, flip.max_value = 1.0, 0.0, 1.0
+    packed = iface.new_socket('Packed (DXT5nm)', in_out='INPUT', socket_type='NodeSocketFloat')
+    packed.default_value, packed.min_value, packed.max_value = 1.0, 0.0, 1.0
     iface.new_socket('Normal Color', in_out='OUTPUT', socket_type='NodeSocketColor')
     N, L = ng.nodes, ng.links
     gin, gout = N.new('NodeGroupInput'), N.new('NodeGroupOutput')
@@ -190,7 +196,11 @@ def sc2_normal_decode_group():
     one_minus_2g = _math(ng, 'MULTIPLY_ADD', g, -2.0, c=1.0, loc=(-500, -150))          # 1 - 2g
     g_flip = _math(ng, 'ADD', g, _math(ng, 'MULTIPLY', gin.outputs['Flip Green'], one_minus_2g,
                                        loc=(-300, -100)), loc=(-100, 0))               # g or 1-g
-    x = _math(ng, 'MULTIPLY_ADD', gin.outputs['Alpha'], 2.0, c=-1.0, loc=(150, 250))
+    # X source: alpha (packed) or red (plain):  r + packed * (alpha - r)
+    x_src = _math(ng, 'ADD', sep.outputs['Red'], _math(ng, 'MULTIPLY', gin.outputs['Packed (DXT5nm)'],
+                  _math(ng, 'SUBTRACT', gin.outputs['Alpha'], sep.outputs['Red'], loc=(-300, 350)), loc=(-150, 350)),
+                  loc=(0, 350))
+    x = _math(ng, 'MULTIPLY_ADD', x_src, 2.0, c=-1.0, loc=(150, 250))
     y = _math(ng, 'MULTIPLY_ADD', g_flip, 2.0, c=-1.0, loc=(150, 0))
     xx = _math(ng, 'MULTIPLY', x, x, loc=(300, 250))
     yy = _math(ng, 'MULTIPLY', y, y, loc=(300, 0))
@@ -198,16 +208,37 @@ def sc2_normal_decode_group():
                                 loc=(450, 100), clamp=True), loc=(450, -50))
     comb = N.new('ShaderNodeCombineColor')
     comb.location = (550, 0)
-    L.new(gin.outputs['Alpha'], comb.inputs['Red'])
+    L.new(x_src, comb.inputs['Red'])
     L.new(g_flip, comb.inputs['Green'])
     L.new(_math(ng, 'MULTIPLY_ADD', z, 0.5, c=0.5, loc=(500, -200)), comb.inputs['Blue'])
     L.new(comb.outputs['Color'], gout.inputs['Normal Color'])
     return ng
 
 
+_PACKED_CACHE = {}
+
+
+def normal_is_packed(img):
+    """True for SC2's packed "DXT5nm" normal maps (X in alpha, blue unused), False for plain RGB
+    normal maps (blue = Z, mostly near 1, alpha constant)."""
+    if img is None:
+        return True
+    if img.name in _PACKED_CACHE:
+        return _PACKED_CACHE[img.name]
+    try:
+        px = _pixels(img)[::4, ::4]
+        blue, alpha = px[..., 2], px[..., 3]
+        plain = blue.mean() > 0.6 and alpha.std() < 0.02
+        packed = not plain
+    except Exception:
+        packed = True
+    _PACKED_CACHE[img.name] = packed
+    return packed
+
+
 SETTINGS_OUTPUTS = (('Team Color', 'team_color'), ('Specular Strength', 'specular_strength'),
                     ('Reflection Strength', 'reflection_strength'), ('Emission Strength', 'emission_strength'),
-                    ('Distortion Visibility', 'distortion_visibility'))
+                    ('Distortion Visibility', 'distortion_visibility'), ('Sun Direction', 'sun_direction'))
 
 
 def settings_group():
@@ -221,14 +252,15 @@ def settings_group():
     out = ng.nodes.new('NodeGroupOutput')
     out.location = (300, 0)
     for i, (label, prop) in enumerate(SETTINGS_OUTPUTS):
-        kind = 'NodeSocketColor' if prop == 'team_color' else 'NodeSocketFloat'
+        kind = {'team_color': 'NodeSocketColor', 'sun_direction': 'NodeSocketVector'}.get(prop, 'NodeSocketFloat')
         ng.interface.new_socket(label, in_out='OUTPUT', socket_type=kind)
         n = ng.nodes.new('ShaderNodeAttribute')
         n.attribute_type = 'VIEW_LAYER'          # looks up the view layer, then the scene
         n.attribute_name = prop
         n.label = f'Scene property "{prop}"'
         n.location = (0, -i * 220)
-        ng.links.new(n.outputs['Color' if prop == 'team_color' else 'Fac'], out.inputs[label])
+        outname = {'team_color': 'Color', 'sun_direction': 'Vector'}.get(prop, 'Fac')
+        ng.links.new(n.outputs[outname], out.inputs[label])
     return ng
 
 
@@ -265,14 +297,15 @@ def mapping_is_identity(layer):
 
 
 def transform_uvs(uvs, layer):
-    """Apply a layer's rest UV transform (M3 texture space, V down) to a flat [u0, v0, u1, v1...] list."""
+    """Apply a layer's rest UV transform (M3 texture space: V down, pivot at the texture centre) to a
+    flat [u0, v0, u1, v1...] list."""
     _, (ox, oy), (tx, ty), ang = static_uv(layer)
     c, s_ = math.cos(ang), math.sin(ang)
     out = []
     for i in range(0, len(uvs), 2):
-        x, y = uvs[i] * tx, (1.0 - uvs[i + 1]) * ty
+        x, y = (uvs[i] - 0.5) * tx, (0.5 - uvs[i + 1]) * ty          # centred M3 space (V down)
         x, y = x * c - y * s_ + ox, x * s_ + y * c + oy
-        out += (x, 1.0 - y)
+        out += (x + 0.5, 0.5 - y)
     return out
 
 
@@ -293,6 +326,14 @@ def export_plan(layers, m3mat, mtype):
             plan['main'], plan['role'] = layer, role
             break
     plan['glow'] = plan['role'] in ('emissive', 'emissive2') or bool(getattr(m3mat, 'unshaded', False))
+    plan['emissive_layer'] = None
+    if plan['role'] in ('diffuse', 'decal'):     # a separate glow on top of a diffuse texture
+        for role, mode_attr in (('emissive', 'blend_mode_emis1'), ('emissive2', 'blend_mode_emis2')):
+            el = layers.get(role)
+            if el is not None and layer_bitmap(el) and getattr(m3mat, mode_attr, 'ADD') not in ('TEAMEMIS', 'TEAMDIFF') \
+                    and same_mapping(el, plan['main']):
+                plan['emissive_layer'] = el
+                break
     plan['hdr_emis'] = float(getattr(m3mat, 'hdr_emis', 1.0) or 1.0)
     blend = getattr(m3mat, 'blend_mode', 'OPAQUE')
     if blend in ('ADD', 'ALPHAA'):
@@ -313,15 +354,20 @@ def _pixels(img):
     return arr.reshape(h, w, 4)
 
 
-def layer_ops(layer):
+def layer_ops(layer, peaks=None):
     """The colour operations a layer applies on top of its texture, in the order the .blend
     material applies them: channel select -> invert -> x brightness x multiply -> + add -> clamp
     -> x fresnel (only a constant fresnel, min == max, can be baked)."""
     f = 1.0
     if layer.fresnel_type != 'DISABLED':
         f = (layer.fresnel_min + layer.fresnel_max) / 2.0
+    # animated brightness/multiply/add (fade-ins, pulses, effects that are off at rest): use the
+    # strongest value the animation reaches, so the baked texture shows the effect when it's on
+    peaks = peaks or {}
+    lp = layer_path(layer)
+    get = lambda prop: peaks.get(f'{lp}.{prop}', getattr(layer, prop))
     return {'channels': layer.color_channels, 'invert': bool(layer.color_invert),
-            'scale': layer.color_brightness * layer.color_multiply, 'add': layer.color_add,
+            'scale': get('color_brightness') * get('color_multiply'), 'add': get('color_add'),
             'clamp': bool(layer.color_clamp), 'fresnel': f, 'post': 1.0}
 
 
@@ -389,10 +435,11 @@ def derive_texture(out_path, main_img, main_ops, alpha_mode, alpha_img=None, alp
 _DERIVED = {}   # (out_dir, signature) -> png path, so identical derived textures are written once
 
 
-def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=None, normal_mode='raw'):
+def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=None, normal_mode='raw',
+                          peaks=None):
     """Principled material for Blender's COLLADA/OBJ exporters. Returns (material, info) where info
     tells postprocess_dae what Blender's exporter can't write ({'alpha': bool, 'glow': bool})."""
-    info = {'alpha': False, 'glow': False, 'emission_node': None}
+    info = {'alpha': False, 'glow': False, 'emission_node': None, 'emission_file': None}
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -413,7 +460,7 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
         return mat, info
 
     stem = os.path.splitext(os.path.basename(png))[0]
-    main_ops = layer_ops(main)
+    main_ops = layer_ops(main, peaks)
     if plan['role'] in ('emissive', 'emissive2'):
         main_ops['post'] = plan.get('hdr_emis', 1.0)   # glow strength, capped at full brightness
     alpha_mode, alpha_img, alpha_ops = None, None, None
@@ -429,7 +476,7 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
             report.setdefault('not_in_export', []).append(f'{name}:alpha (different UV mapping)')
             alpha_img = None
         else:
-            alpha_mode, alpha_ops = 'mask', layer_ops(al)
+            alpha_mode, alpha_ops = 'mask', layer_ops(al, peaks)
 
     use_img, has_alpha = img, False
     # the plain texture works as-is when nothing needs baking
@@ -470,6 +517,38 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
         info['alpha'] = True
     info['glow'] = plan['glow']
     info['emission_node'] = tex          # linked to Emission only for the OBJ export (see blender_convert)
+    el = plan.get('emissive_layer')
+    if el is not None:
+        epng = tex_map.get(norm_tex_key(layer_bitmap(el)))
+        eimg = load_image(epng)
+        if eimg is not None:
+            eops = layer_ops(el, peaks)
+            eops['post'] = plan.get('hdr_emis', 1.0)
+            try:
+                if ops_identity(eops):
+                    use_e = eimg
+                else:
+                    estem = os.path.splitext(os.path.basename(epng))[0]
+                    sig = (out_dir, estem, 'Emission', tuple(sorted(eops.items())))
+                    path = _DERIVED.get(sig)
+                    if path is None:
+                        path = os.path.join(out_dir, f'{estem}_Emission.png')
+                        k = 2
+                        while path in _DERIVED.values():
+                            path = os.path.join(out_dir, f'{estem}_Emission{k}.png')
+                            k += 1
+                        derive_texture(path, eimg, eops, None)
+                        _DERIVED[sig] = path
+                    use_e = load_image(path)
+                enode = nt.nodes.new('ShaderNodeTexImage')
+                enode.image = use_e
+                enode.location = (-600, -300)
+                info.update(glow=True, emission_node=enode,
+                            emission_file=os.path.basename(bpy.path.abspath(use_e.filepath)))
+            except Exception as e:
+                report.setdefault('warnings', []).append(f'{name}: emission texture failed: {e!r}')
+        else:
+            report['missing_textures'].add(layer_bitmap(el))
     if normal_mode == 'rgb' and normal_layer is not None and layer_bitmap(normal_layer) \
             and same_mapping(normal_layer, main):
         nimg = load_image(tex_map.get(norm_tex_key(layer_bitmap(normal_layer))), non_color=True)
@@ -573,18 +652,33 @@ class SC2MaterialBuilder:
         self.targets.append((f'{self.m3mat.path_from_id()}.{prop}', 0, v.outputs[0], None))
         return v.outputs[0]
 
+    def blinn_phong(self, normal, exponent):
+        """Scalar Blinn-Phong highlight for the scene's sun direction (scene property sun_direction)."""
+        geo = self.node('ShaderNodeNewGeometry', -900)
+        n = normal if normal is not None else geo.outputs['Normal']
+        light = self.vmath('NORMALIZE', self.setting('Sun Direction')).outputs[0]
+        half = self.vmath('NORMALIZE', self.vmath('ADD', light, geo.outputs['Incoming']).outputs[0]).outputs[0]
+        ndh = self.math('MAXIMUM', self.vmath('DOT_PRODUCT', n, half).outputs['Value'], 0.0)
+        ndl = self.vmath('DOT_PRODUCT', n, light).outputs['Value']
+        facing = self.math('MINIMUM', self.math('MAXIMUM', self.math('MULTIPLY', ndl, 8.0), 0.0), 1.0)
+        return self.math('MULTIPLY', self.math('POWER', ndh, exponent), facing)
+
     def normal_socket(self):
         nrm = self.sample('normal', non_color=True)
         if nrm is None:
             return None
         nmap = self.node('ShaderNodeNormalMap', 0, uv_map=UV_SET.get(nrm['layer'].uv_source, 'uv0'))
         if self.normal_mode == 'raw':
+            # SC2 uses both packed "DXT5nm" (X in alpha) and plain RGB normal maps
+            png = self.tex_map.get(norm_tex_key(layer_bitmap(nrm['layer'])))
+            img = load_image(png, non_color=True)
             g = self.node('ShaderNodeGroup', -150)
             g.node_tree = sc2_normal_decode_group()
+            g.inputs['Packed (DXT5nm)'].default_value = 1.0 if normal_is_packed(img) else 0.0
             self.link(nrm['rgb'], g.inputs['Color'])
             self.link(nrm['alpha'], g.inputs['Alpha'])
             self.link(g.outputs['Normal Color'], nmap.inputs['Color'])
-        else:
+        else:   # already converted to standard OpenGL-convention RGB by sc2rip
             self.link(nrm['rgb'], nmap.inputs['Color'])
         return nmap.outputs['Normal']
 
@@ -685,9 +779,11 @@ class SC2MaterialBuilder:
             return vec
         if vec is None:
             vec = self.node('ShaderNodeUVMap', -1100, uv_map='uv0').outputs['UV']
-        # M3 texture space has V pointing down: flip into it, apply offset/rotation/tiling, flip back
+        # M3 texture space has V pointing down, and tiling/rotation pivot on the texture centre (as in
+        # 3ds Max, which these models come from): flip into M3 space centred on (0.5, 0.5), apply
+        # tiling/rotation/offset, then move back
         flip_in = self.node('ShaderNodeMapping', -950, vector_type='POINT')
-        flip_in.inputs['Location'].default_value = (0, 1, 0)
+        flip_in.inputs['Location'].default_value = (-0.5, 0.5, 0)      # (u - .5, (1 - v) - .5)
         flip_in.inputs['Scale'].default_value = (1, -1, 1)
         self.link(vec, flip_in.inputs['Vector'])
         m = self.node('ShaderNodeMapping', -800, vector_type='POINT', label='M3 UV transform')
@@ -702,7 +798,7 @@ class SC2MaterialBuilder:
         for i in range(3):
             self.targets.append((lp + '.uv_angle', i, m.inputs['Rotation'], i))
         flip_out = self.node('ShaderNodeMapping', -650, vector_type='POINT')
-        flip_out.inputs['Location'].default_value = (0, 1, 0)
+        flip_out.inputs['Location'].default_value = (0.5, 0.5, 0)      # (x + .5, 1 - (y + .5))
         flip_out.inputs['Scale'].default_value = (1, -1, 1)
         self.link(m.outputs[0], flip_out.inputs['Vector'])
         return flip_out.outputs[0]
@@ -862,21 +958,7 @@ class SC2MaterialBuilder:
             base = rgbn.outputs[0]
 
         # --- normal map
-        normal = None
-        nrm = self.sample('normal', non_color=True)
-        if nrm is not None:
-            self.y -= 100
-            nmap = self.node('ShaderNodeNormalMap', 0, uv_map=UV_SET.get(nrm['layer'].uv_source, 'uv0'))
-            if self.normal_mode == 'raw':
-                g = self.node('ShaderNodeGroup', -150)
-                g.node_tree = sc2_normal_decode_group()
-                tex_color = nrm['rgb']
-                self.link(tex_color, g.inputs['Color'])
-                self.link(nrm['alpha'], g.inputs['Alpha'])
-                self.link(g.outputs['Normal Color'], nmap.inputs['Color'])
-            else:
-                self.link(nrm['rgb'], nmap.inputs['Color'])
-            normal = nmap.outputs['Normal']
+        normal = self.normal_socket()
 
         self.y = 600
         if getattr(m, 'unshaded', False):
@@ -901,25 +983,18 @@ class SC2MaterialBuilder:
                 srgb = self.vmath('SCALE', srgb, scale=self.setting('Specular Strength')).outputs[0]
                 n_exp = max(getattr(m, 'specularity', 20.0) or 20.0, 1.0)
                 gloss = self.sample('gloss')
-                n_sock = self.math('MULTIPLY', gloss['gray'], n_exp) if gloss else None
-                # Blinn-Phong exponent n -> GGX roughness: alpha = sqrt(2 / (n + 2)), roughness = sqrt(alpha)
-                if n_sock is not None:
-                    rough = self.math('POWER', self.math('DIVIDE', 2.0, self.math('ADD', self.math(
-                        'MAXIMUM', n_sock, 1.0), 2.0)), 0.25)
-                else:
-                    rough = (2.0 / (n_exp + 2.0)) ** 0.25
-                gl = self.node('ShaderNodeBsdfGlossy', 300,
-                               distribution='GGX')
-                self.link(srgb, gl.inputs['Color'])
-                if isinstance(rough, float):
-                    gl.inputs['Roughness'].default_value = rough
-                else:
-                    self.link(rough, gl.inputs['Roughness'])
-                if normal is not None:
-                    self.link(normal, gl.inputs['Normal'])
+                n_sock = self.math('MAXIMUM', self.math('MULTIPLY', gloss['gray'], n_exp), 1.0) if gloss else n_exp
+                # SC2's highlight comes from its sun only (environment reflection is the envio layer's
+                # job), so instead of a Glossy BSDF - which reflects the whole environment and blows
+                # out at SC2's spec strengths - compute a Blinn-Phong highlight from the sun direction:
+                #   spec = colour * max(N.H, 0)^n * [N.L > 0],   H = normalize(L + V)
+                hl = self.blinn_phong(normal, n_sock)
+                spec_rgb = self.vmath('SCALE', srgb, scale=hl).outputs[0]
+                em = self.node('ShaderNodeEmission', 300, label='SC2 specular highlight')
+                self.link(spec_rgb, em.inputs['Color'])
                 add = self.node('ShaderNodeAddShader', 500)
                 self.link(shader, add.inputs[0])
-                self.link(gl.outputs[0], add.inputs[1])
+                self.link(em.outputs[0], add.inputs[1])
                 shader = add.outputs[0]
 
         # --- emissive + environment reflection, added on top (as in SC2)

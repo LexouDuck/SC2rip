@@ -183,10 +183,10 @@ glow added on top. sc2rip rebuilds that from the M3 material's own parameters:
 | M3 material | Blender nodes |
 |---|---|
 | diffuse layer (+ team colour when its channels are ARGB), decal (screen-blended by its alpha), vertex colour | Diffuse BSDF colour |
-| specular map × *HDR specular*, sharpness from *specularity* (× gloss map) | Glossy BSDF, added on top. The Blinn-Phong exponent n becomes roughness (2/(n+2))^¼ |
+| specular map × *HDR specular*, sharpness from *specularity* (× gloss map) | Blinn-Phong highlight from the sun, added as emission (see below) |
 | environment ("envio") map, looked up by the reflection vector, × envio mask × *HDR envio* | added as emission. Cubemaps are converted to a panorama |
 | emissive 1 & 2 × *HDR emissive* (team-coloured for "team colour emissive" blend modes) | added as emission |
-| normal map (SC2's DXT5nm packing decoded by the *SC2 Normal Decode* group) | Normal Map |
+| normal map, packed "DXT5nm" or plain RGB, decoded by the *SC2 Normal Decode* group | Normal Map |
 | alpha masks, blend mode (opaque cut-out / alpha blend / additive), two-sided, unshaded | transparency, backface culling, emission-only |
 | per-layer UV source (UV sets 1–4, planar, tri-planar, screen), UV offset / rotation / tiling, channel selection, invert, brightness, fresnel | UV Map / Mapping / math nodes in front of each texture |
 
@@ -202,6 +202,7 @@ Properties** tab (cone-and-spheres icon in the Properties editor) and expand **C
 | `reflection_strength` | multiplier on environment reflections |
 | `emission_strength` | multiplier on emissive glow |
 | `distortion_visibility` | how visible distortion effects are (warp-in fields, heat haze; see below) |
+| `sun_direction` | direction of the light that makes the specular highlights. Driven by the **Light** object: rotate the lamp and the highlights follow |
 
 Changing a value changes every material in the file at once. Material Preview updates live.
 
@@ -213,6 +214,13 @@ material into another file, add the same scene properties there, or the values r
 
 There's no metallic value to set: the "sheen" SC2 models have comes from their specular map and
 reflection map, which are both reproduced.
+
+**Specular highlights** follow SC2's model: a Blinn-Phong highlight from the scene's sun only.
+Reflections of the surroundings come from the separate environment ("envio") layer, if the material
+has one. A Glossy BSDF can't be used for this: it reflects the whole environment, and at SC2's spec
+strengths (often several times full brightness, e.g. the Pylon crystal) it turns surfaces white.
+So the highlight is computed in the material from `sun_direction`, which follows the "Light" lamp.
+In Material Preview the HDRI lights the diffuse part, and the highlights still come from that lamp.
 
 ### Effect materials
 
@@ -229,7 +237,10 @@ In the `.dae`/`.obj` these effect materials are written **fully transparent** (a
 
 ### Normal maps
 
-The *SC2 Normal Decode (DXT5nm)* group has a **Flip Green** input, set to 1
+SC2 uses two normal-map formats: packed "DXT5nm" (X in the alpha channel, Y in green, no blue)
+and plain RGB normal maps. sc2rip detects which one each texture is. The *SC2 Normal Decode* group's
+**Packed (DXT5nm)** input is set to 1 or 0 accordingly; if a model's bumps look completely wrong,
+that's the value to check. The group also has a **Flip Green** input, set to 1
 (DirectX convention, as the older SC2 Blender add-on also assumes). If bumps look like dents, set
 it to 0. With `--normal-maps rgb`, the PNGs are converted to regular OpenGL-convention (Blender)
 normal maps instead.
@@ -255,10 +266,13 @@ material is reduced to that:
     are see-through. OBJ/COLLADA can't do true additive blending, so glows are alpha-blended
     over what's behind them instead;
 * **colour operations** the layer applies in game (brightness, multiply, add, clamp, the glow's
-  HDR strength) are baked into the texture.
+  HDR strength) are baked into the texture. Animated brightness (effects that fade in, or are off
+  at rest like the Stargate's halo) is baked at the **strongest value it reaches**;
+* **glow**: when a material has a diffuse texture *and* a separate emissive layer on the same UVs
+  (e.g. the Pylon crystal), the emissive layer is exported as a glow texture.
 
 When anything needs baking, an extra PNG is written next to the original:
-`<texture>_Additive.png`, `<texture>_Alpha.png` or `<texture>_Color.png`. The original textures are
+`<texture>_Additive.png`, `<texture>_Alpha.png`, `<texture>_Color.png` or `<texture>_Emission.png`. The original textures are
 always there unchanged too.
 
 In the files:
@@ -315,8 +329,6 @@ On your first `--list-only` run, please check:
 3. A few shading details are educated guesses, because no public documentation covers them:
    * which way the green channel of normal maps points (*Flip Green*, see above);
    * how cube environment maps are oriented (assumed Direct3D cube faces, with the game's Z-up mapped to D3D's Y-up);
-   * where UV rotation pivots (assumed the UV origin);
-   * the specularity → roughness conversion;
    * how strong distortion effects should look (`distortion_visibility`);
    * the non-looping end-key rule (see "Clip ranges and looping"). If a non-looping animation
      still drifts back at its end, tell me which model and animation, so I can look at its keys.
