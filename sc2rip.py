@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
-CONVERTER_VERSION = '2'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '3'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -202,8 +202,95 @@ def folder_for(m):
 # Textures
 # --------------------------------------------------------------------------------------
 
-def dds_to_png(data, out_path, normal_mode='raw', is_normal=False):
+def dds_is_cubemap(data):
+    import struct
+    if len(data) < 128 or data[:4] != b'DDS ':
+        return False
+    caps2 = struct.unpack_from('<I', data, 4 + 108)[0]
+    return bool(caps2 & 0x200)
+
+
+def dds_cube_faces(data):
+    """Split a cubemap DDS into its 6 faces (+X,-X,+Y,-Y,+Z,-Z) as PIL images."""
+    import struct
     from PIL import Image
+    h, w = struct.unpack_from('<II', data, 12)
+    mips = max(1, struct.unpack_from('<I', data, 28)[0])
+    pf_flags, fourcc = struct.unpack_from('<I4s', data, 80)
+    rgb_bits = struct.unpack_from('<I', data, 88)[0]
+    hdr = 128
+    if fourcc == b'DX10':
+        hdr += 20
+        dxgi = struct.unpack_from('<I', data, 128)[0]
+        block = 8 if dxgi in (70, 71, 72, 79, 80, 81) else 16   # BC1/BC4 vs others
+        bc = dxgi in range(70, 100)
+        bpp = None if bc else 32
+    elif pf_flags & 0x4:   # FourCC compressed
+        bc = True
+        block = 8 if fourcc in (b'DXT1', b'ATI1', b'BC4U', b'BC4S') else 16
+    else:
+        bc = False
+        bpp = rgb_bits or 32
+
+    def level_size(lw, lh):
+        if bc:
+            return max(1, (lw + 3) // 4) * max(1, (lh + 3) // 4) * block
+        return lw * lh * bpp // 8
+
+    face_stride = sum(level_size(max(1, w >> i), max(1, h >> i)) for i in range(mips))
+    top = level_size(w, h)
+    header = bytearray(data[:hdr])
+    struct.pack_into('<I', header, 28, 1)            # one mip level
+    struct.pack_into('<I', header, 4 + 108, 0)       # not a cubemap any more
+    caps = struct.unpack_from('<I', header, 4 + 104)[0] & ~0x400008
+    struct.pack_into('<I', header, 4 + 104, caps | 0x1000)
+    if fourcc == b'DX10':
+        struct.pack_into('<I', header, 128 + 12, 1)  # arraySize
+        misc = struct.unpack_from('<I', header, 128 + 8)[0] & ~0x4
+        struct.pack_into('<I', header, 128 + 8, misc)
+    faces = []
+    for f in range(6):
+        start = hdr + f * face_stride
+        im = Image.open(io.BytesIO(bytes(header) + data[start:start + top]))
+        im.load()
+        faces.append(im.convert('RGBA'))
+    return faces
+
+
+def cube_to_equirect(faces, width=1024):
+    """Cube faces -> equirectangular panorama in Blender's convention (Z up). The cube is looked up
+    Direct3D-style with the game's Z-up vector mapped to D3D's Y-up (x, z, y)."""
+    import numpy as np
+    from PIL import Image
+    H, W = width // 2, width
+    u = (np.arange(W) + 0.5) / W
+    v = (np.arange(H) + 0.5) / H
+    uu, vv = np.meshgrid(u, v)
+    phi = (0.5 - uu) * 2 * np.pi              # Blender: u = -atan2(dy, dx) / 2pi + 0.5 (+X at centre)
+    lat = (0.5 - vv) * np.pi                  # image row 0 = top
+    dx, dy, dz = np.cos(lat) * np.cos(phi), np.cos(lat) * np.sin(phi), np.sin(lat)
+    x, y, z = dx, dz, dy                      # world (Z up) -> D3D cube space (Y up)
+    ax, ay, az = np.abs(x), np.abs(y), np.abs(z)
+    out = np.zeros((H, W, 4), np.uint8)
+    arrs = [np.asarray(f) for f in faces]
+    size = arrs[0].shape[0]
+    conds = [(ax >= ay) & (ax >= az) & (x > 0), (ax >= ay) & (ax >= az) & (x <= 0),
+             (ay > ax) & (ay >= az) & (y > 0), (ay > ax) & (ay >= az) & (y <= 0),
+             (az > ax) & (az > ay) & (z > 0), (az > ax) & (az > ay) & (z <= 0)]
+    sc_tc_ma = [(-z, -y, ax), (z, -y, ax), (x, z, ay), (x, -z, ay), (x, -y, az), (-x, -y, az)]
+    for i, (cond, (sc, tc, ma)) in enumerate(zip(conds, sc_tc_ma)):
+        fu = ((sc / np.maximum(ma, 1e-9) + 1) / 2 * size).astype(int).clip(0, size - 1)
+        fv = ((tc / np.maximum(ma, 1e-9) + 1) / 2 * size).astype(int).clip(0, size - 1)
+        out[cond] = arrs[i][fv[cond], fu[cond]]
+    return Image.fromarray(out, 'RGBA')
+
+
+def dds_to_png(data, out_path, normal_mode='raw', is_normal=False):
+    """Returns 'equirect' when the DDS was a cubemap (converted to a panorama), else None."""
+    from PIL import Image
+    if dds_is_cubemap(data):
+        cube_to_equirect(dds_cube_faces(data)).save(out_path, 'PNG')
+        return 'equirect'
     im = Image.open(io.BytesIO(data))
     im.load()
     if im.mode not in ('RGBA', 'RGB', 'L', 'LA'):
@@ -213,13 +300,14 @@ def dds_to_png(data, out_path, normal_mode='raw', is_normal=False):
             import numpy as np
             a = np.asarray(im).astype('float32') / 255.0
             x = a[..., 3] * 2 - 1          # SC2 stores X in alpha ("DXT5nm")
-            y = a[..., 1] * 2 - 1
+            y = 1 - a[..., 1] * 2          # ... and Y DirectX-style: flip to OpenGL / Blender
             z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
             rgb = np.stack([(x + 1) / 2, (y + 1) / 2, (z + 1) / 2], -1)
             im = Image.fromarray((rgb * 255 + 0.5).astype('uint8'), 'RGB')
         except ImportError:
             pass
     im.save(out_path, 'PNG', optimize=False)
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -449,13 +537,19 @@ def main():
         folder_items = folder_items[:args.limit]
 
     tex_cache = {}  # storage path -> png in cache (or None on failure)
+    equirect_pngs = set()  # cached pngs that are cubemaps converted to panoramas
+    equirect_list = os.path.join(png_cache, '_equirect.txt')
+    if os.path.isfile(equirect_list):
+        equirect_pngs.update(open(equirect_list, encoding='utf-8').read().split('\n'))
     tex_fallback = []  # (dds, png) pairs Pillow couldn't decode
 
     def get_png(spath):
         if spath in tex_cache:
             return tex_cache[spath]
         base = os.path.splitext(spath.split('/')[-1])[0]
-        h = hashlib.sha1(spath.lower().encode()).hexdigest()[:10]
+        is_normal = bool(re.search(r'(_normal|_nrm|_norm)\b', base.lower()))
+        variant = '|rgb' if (is_normal and args.normal_maps == 'rgb') else ''
+        h = hashlib.sha1((spath.lower() + variant).encode()).hexdigest()[:10]
         dst = os.path.join(png_cache, f'{base}__{h}.png')
         if not os.path.isfile(dst):
             try:
@@ -464,9 +558,11 @@ def main():
                 log(f'    ! cannot read texture {spath}: {e}')
                 tex_cache[spath] = None
                 return None
-            is_normal = bool(re.search(r'(_normal|_nrm|_norm)\b', base.lower()))
             try:
-                dds_to_png(data, dst, args.normal_maps, is_normal)
+                if dds_to_png(data, dst, args.normal_maps, is_normal) == 'equirect':
+                    equirect_pngs.add(dst)
+                    with open(equirect_list, 'a', encoding='utf-8') as f:
+                        f.write(dst + '\n')
             except Exception as e:
                 raw = os.path.join(work, 'tex_raw', f'{base}__{h}' + os.path.splitext(spath)[1])
                 os.makedirs(os.path.dirname(raw), exist_ok=True)
@@ -584,14 +680,17 @@ def main():
         textures_out = {}
         for key, (png, dst) in job['tex_map'].items():
             if os.path.isfile(png):
-                if not os.path.isfile(dst):
+                # (re)copy when missing or when the cached conversion is different / newer
+                if not os.path.isfile(dst) or os.path.getsize(dst) != os.path.getsize(png) or \
+                        os.path.getmtime(dst) < os.path.getmtime(png):
                     shutil.copyfile(png, dst)
                 textures_out[key] = dst
         jid = hashlib.sha1(job['folder'].encode()).hexdigest()[:12]
         jpath = os.path.join(job_dir, jid + '.json')
         rpath = os.path.join(job_dir, jid + '.result.json')
+        equirect = sorted(k for k, (png, _) in job['tex_map'].items() if png in equirect_pngs)
         job_data = {'m3studio': m3studio, 'models': job['models'], 'textures': textures_out,
-                    'options': options, 'result': rpath}
+                    'equirect': equirect, 'options': options, 'result': rpath}
         # reuse a previous result only if it was produced from exactly the same job (same models,
         # textures, options and converter version) and every expected output file still exists
         if not args.force and os.path.isfile(rpath) and os.path.isfile(jpath):

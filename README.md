@@ -117,7 +117,7 @@ regardless.
 | `--filter REGEX` / `--exclude REGEX` | match output folder path / skip storage paths (e.g. `--exclude _portrait`) |
 | `--anim-mode timeline\|separate\|both\|none` | see below (default `timeline`) |
 | `--anim-sampling N` | sample every N frames (base rate 30 fps). Use 2 to halve animated file sizes. |
-| `--normal-maps raw\|rgb` | `raw` keeps SC2's DXT5nm layout (X in alpha, Y in green); `rgb` rebuilds a standard normal map |
+| `--normal-maps raw\|rgb` | `raw` keeps SC2's DXT5nm layout (X in alpha, Y in green); `rgb` rebuilds a standard (OpenGL/Blender-convention) normal map |
 | `--save-blend` | also save a ready-to-view `.blend` per model (see "Viewing in Blender") |
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
@@ -146,35 +146,61 @@ Blender's own output.
 
 Each model also gets a Wavefront `.obj` + `.mtl`. OBJ can't store a skeleton or animation, so it's
 the model in its **bind pose** (the pose the mesh is stored in), Y-up as is usual for OBJ. The
-`.mtl` references the diffuse and emissive PNGs, and the normal map too when you use
-`--normal-maps rgb`. With the default `raw` normal maps it's left out on purpose: no OBJ viewer
+`.mtl` references the diffuse and emissive PNGs (when they use the first UV set), and the normal
+map too when you use `--normal-maps rgb`. With the default `raw` normal maps it's left out on purpose: no OBJ viewer
 understands the SC2 packing.
 
 ## Viewing in Blender
 
 With `--save-blend`, each `.blend` is set up to open ready to look at:
 
-* the viewport is in **Material Preview** mode. That uses Blender's built-in studio HDRI lighting,
-  which is the best way to see normal, specular and emissive maps, and needs no setup;
-* the view is framed on the model;
-* every texture is wired into the material, with paths relative to the `.blend`, so the folder can
-  be moved or shared;
-* the animation timeline is loaded with a **named marker at the start of every animation**. Press
-  space to play, or jump between markers with the marker menu or Shift+arrow keys;
-* there's a sun lamp and a neutral grey world, for when you switch to **Rendered** mode (Z → Rendered).
-  In Material Preview, the lighting can be changed in the viewport-shading popover (the small arrow
-  next to the shading buttons, top right): pick another HDRI, rotate it, or raise *World Opacity*
-  to see it as a background.
+* the viewport is in **Material Preview** mode (Blender's built-in studio HDRI lighting), framed on
+  the model;
+* textures use paths relative to the `.blend`, so the folder can be moved or shared;
+* the animation timeline is loaded with a **named marker at the start of every animation**
+  (space to play; Shift+arrow keys or the marker menu to jump between them), including
+  **texture animations** (see below);
+* a sun lamp and a neutral grey world are included for **Rendered** mode (Z → Rendered).
 
-**Normal maps**: SC2 stores them as "DXT5nm" (X in the alpha channel, Y in green, no blue).
-The material decodes this with a small node group, *SC2 Normal Decode (DXT5nm)*, sitting between
-the normal texture and the Normal Map node. Which way SC2's green channel points isn't documented,
-so the group has a **Flip Green** input (0 or 1). If bumps look like dents, open the Shader Editor,
-select the node group and set Flip Green to 1. If you rip with `--normal-maps rgb`, the PNG is
-already a regular blue normal map, and it's plugged straight into the Normal Map node.
+### SC2-style materials
 
-**Team colour**: the diffuse texture's alpha (the team-colour mask) is kept but not used by the
-material, so team-coloured areas show the texture's underlying base colour.
+The `.blend` doesn't use Principled BSDF. SC2's shading predates PBR: there's no metallic or
+roughness, it's diffuse lighting plus a coloured specular highlight, with a reflection map and
+glow added on top. sc2rip rebuilds that from the M3 material's own parameters:
+
+| M3 material | Blender nodes |
+|---|---|
+| diffuse layer (+ team colour when its channels are ARGB), decal (screen-blended by its alpha), vertex colour | Diffuse BSDF colour |
+| specular map × *HDR specular*, sharpness from *specularity* (× gloss map) | Glossy BSDF, added on top. The Blinn-Phong exponent n becomes roughness (2/(n+2))^¼ |
+| environment ("envio") map, looked up by the reflection vector, × envio mask × *HDR envio* | added as emission. Cubemaps are converted to a panorama |
+| emissive 1 & 2 × *HDR emissive* (team-coloured for "team colour emissive" blend modes) | added as emission |
+| normal map (SC2's DXT5nm packing decoded by the *SC2 Normal Decode* group) | Normal Map |
+| alpha masks, blend mode (opaque cut-out / alpha blend / additive), two-sided, unshaded | transparency, backface culling, emission-only |
+| per-layer UV source (UV sets 1–4, planar, tri-planar, screen), UV offset / rotation / tiling, channel selection, invert, brightness, fresnel | UV Map / Mapping / math nodes in front of each texture |
+
+**What I'd tweak first, if a model looks off**: every material uses one shared node group called
+**SC2 Settings** (open any material in the Shader Editor and Tab into it). It holds:
+
+* **Team Color**: default red;
+* **Specular / Reflection / Emission Strength**: multipliers on top of the model's own values (1.0).
+  Lower *Reflection Strength* if the environment map looks too strong, or raise *Specular
+  Strength* for more sheen.
+
+Changing a value there changes every material in the file at once. There's no metallic value to
+set: the "sheen" SC2 models have comes from their specular map and reflection map, which are both
+reproduced.
+
+**Normal maps**: the *SC2 Normal Decode (DXT5nm)* group has a **Flip Green** input, set to 1
+(DirectX convention, as the older SC2 Blender add-on also assumes). If bumps look like dents, set
+it to 0. With `--normal-maps rgb`, the PNGs are converted to regular OpenGL-convention (Blender)
+normal maps instead.
+
+### Texture animations
+
+Animated layer properties (scrolling, rotating or scaling UVs, brightness/colour pulses) are keyed
+on the material nodes, on the same timeline and with the same markers as the skeleton, so they play
+along with each animation in the `.blend`. **They can't be carried in the `.dae` or `.obj`**: COLLADA
+and OBJ have no standard way to store texture animation, and no common importer would read it.
 
 ## What's in the .dae / known limitations
 
@@ -182,6 +208,10 @@ material, so team-coloured areas show the texture's underlying base colour.
   writes. Every other texture the model uses (normal, specular, emissive, ...) is still converted
   and put in the folder. The `.obj` references a few more (see above), and the `.blend` has them
   all wired up.
+* **Decals & other layers on a second UV set** (e.g. the Protoss logo emissive), or with a UV
+  transform, are **left out of the DAE/OBJ materials** rather than mapped wrongly. OBJ only has
+  one UV set, and the exporters can't express per-texture UV sets. The DAE still contains all
+  UV sets, and the `.blend` maps every layer correctly.
 * **Team colour**: SC2 diffuse textures usually carry the team-colour mask in their **alpha
   channel**. It's preserved in the PNG. Some viewers display it as transparency.
 * **Not exported**: particle systems, ribbons, lights, hit-test/physics volumes, attachment points
@@ -205,6 +235,13 @@ On your first `--list-only` run, please check:
    `mods/void.sc2mod`, ...) and the campaigns with non-zero unit/building counts. If it's empty or
    odd, look at a few lines of `_plan.csv` and tell me what the paths look like.
 2. Anything classified as `other` that you consider campaign or standard can be added with `--containers`.
+3. A few shading details are educated guesses, because no public documentation covers them:
+   * which way the green channel of normal maps points (*Flip Green*, see above);
+   * how cube environment maps are oriented (assumed Direct3D cube faces, with the game's Z-up mapped to D3D's Y-up);
+   * where UV rotation pivots (assumed the UV origin);
+   * the specularity → roughness conversion.
+
+   If one of these looks consistently wrong on real models, tell me what you see and I'll adjust it.
 
 If something fails, the useful bits to send back are `_containers.csv`, the first lines of
 `_report.csv`, and the matching log from `_work/jobs/` (each folder's Blender output is logged there).
@@ -213,7 +250,8 @@ If something fails, the useful bits to send back are `_containers.csv`, the firs
 
 ```
 sc2rip.py           main script (run this)
-blender_convert.py  runs inside Blender: M3 import, materials, animation merge, COLLADA export
+blender_convert.py  runs inside Blender: M3 import, animation merge, COLLADA/OBJ export, .blend
+sc2_material.py     runs inside Blender: export materials and the SC2-style .blend materials
 casc.py             CASC (CascLib) and extracted-folder readers
 tools/casclib/      CascLib builds (MIT licence)
 tools/m3studio/     M3Studio add-on by Solstice245, unmodified (GPL-2.0-or-later)

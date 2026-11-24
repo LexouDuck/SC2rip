@@ -33,6 +33,9 @@ import xml.etree.ElementTree as ET
 
 import bpy
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sc2_material as sm  # noqa: E402
+
 
 # --------------------------------------------------------------------------------------
 # M3Studio loading
@@ -98,219 +101,6 @@ def norm_tex_key(path):
 # Materials
 # --------------------------------------------------------------------------------------
 
-# M3 standard-material layer slot -> role in our Blender material
-LAYER_ROLES = [
-    ('layer_diff', 'diffuse'),
-    ('layer_decal', 'decal'),
-    ('layer_spec', 'specular'),
-    ('layer_gloss', 'gloss'),
-    ('layer_emis1', 'emissive'),
-    ('layer_emis2', 'emissive2'),
-    ('layer_envi', 'envio'),
-    ('layer_envi_mask', 'envio_mask'),
-    ('layer_alpha1', 'alpha'),
-    ('layer_alpha2', 'alpha2'),
-    ('layer_norm', 'normal'),
-    ('layer_height', 'height'),
-    ('layer_light', 'lightmap'),
-    ('layer_ao', 'ao'),
-]
-
-
-def m3_material_from_ref(ob, matref, shared, depth=0):
-    """Resolve an M3 material reference to a concrete M3 material (following composites)."""
-    if matref is None or depth > 4:
-        return None, None
-    coll = getattr(ob, matref.mat_type, None)
-    if coll is None:
-        return None, None
-    mat = shared.m3_pointer_get(coll, matref.mat_handle)
-    if mat is None:
-        return None, None
-    if matref.mat_type == 'm3_materials_composite':
-        for section in mat.sections:
-            sub = shared.m3_pointer_get(ob.m3_materialrefs, section.material)
-            m, t = m3_material_from_ref(ob, sub, shared, depth + 1)
-            if m is not None:
-                return m, t
-        return None, None
-    return mat, matref.mat_type
-
-
-def collect_layers(ob, m3mat, shared):
-    """Return {role: bitmap_path} for an M3 material."""
-    out = {}
-    if m3mat is None:
-        return out
-    for attr, role in LAYER_ROLES:
-        handle = getattr(m3mat, attr, None)
-        if not handle:
-            continue
-        layer = shared.m3_pointer_get(ob.m3_materiallayers, handle)
-        if layer is None:
-            continue
-        bmp = (getattr(layer, 'color_bitmap', '') or '').strip()
-        if bmp and getattr(layer, 'color_type', 'BITMAP') == 'BITMAP':
-            out[role] = bmp
-    # non-standard material types (terrain, creep, volume...) use other slot names
-    if not out:
-        for attr in dir(m3mat):
-            if attr.startswith('layer_'):
-                handle = getattr(m3mat, attr, None)
-                if isinstance(handle, str) and handle:
-                    layer = shared.m3_pointer_get(ob.m3_materiallayers, handle)
-                    bmp = (getattr(layer, 'color_bitmap', '') or '').strip() if layer else ''
-                    if bmp:
-                        out.setdefault('diffuse', bmp)
-    return out
-
-
-def load_image(png_path, non_color=False):
-    if not png_path or not os.path.isfile(png_path):
-        return None
-    img = bpy.data.images.load(os.path.abspath(png_path), check_existing=True)
-    # SC2 alpha channels hold data (team-colour mask, normal X), not transparency
-    img.alpha_mode = 'CHANNEL_PACKED'
-    if non_color:
-        try:
-            img.colorspace_settings.name = 'Non-Color'
-        except TypeError:
-            pass
-    return img
-
-
-def sc2_normal_decode_group():
-    """Node group turning an SC2 DXT5nm texture (X in alpha, Y in green) into a standard
-    tangent-space normal colour. 'Flip Green' switches between OpenGL/DirectX Y conventions."""
-    name = 'SC2 Normal Decode (DXT5nm)'
-    ng = bpy.data.node_groups.get(name)
-    if ng is not None:
-        return ng
-    ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
-    iface = ng.interface
-    iface.new_socket('Color', in_out='INPUT', socket_type='NodeSocketColor')
-    iface.new_socket('Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
-    flip = iface.new_socket('Flip Green', in_out='INPUT', socket_type='NodeSocketFloat')
-    flip.default_value, flip.min_value, flip.max_value = 0.0, 0.0, 1.0
-    iface.new_socket('Normal Color', in_out='OUTPUT', socket_type='NodeSocketColor')
-    N, L = ng.nodes, ng.links
-    gin, gout = N.new('NodeGroupInput'), N.new('NodeGroupOutput')
-    gin.location, gout.location = (-900, 0), (700, 0)
-    sep = N.new('ShaderNodeSeparateColor'); sep.location = (-700, 100)
-    L.new(gin.outputs['Color'], sep.inputs['Color'])
-
-    def math(op, a, b=None, loc=(0, 0), clamp=False):
-        n = N.new('ShaderNodeMath'); n.operation = op; n.location = loc; n.use_clamp = clamp
-        for i, v in enumerate((a, b)):
-            if v is None:
-                continue
-            if isinstance(v, (int, float)):
-                n.inputs[i].default_value = v
-            else:
-                L.new(v, n.inputs[i])
-        return n.outputs[0]
-
-    # green, optionally flipped: g' = g + flip * (1 - 2g)
-    g = sep.outputs['Green']
-    one_minus_2g = math('MULTIPLY_ADD', g, -2.0, loc=(-500, -150))      # g * -2 + 1
-    one_minus_2g.node.inputs[2].default_value = 1.0
-    g_flip = math('ADD', g, math('MULTIPLY', gin.outputs['Flip Green'], one_minus_2g, loc=(-300, -100)),
-                  loc=(-100, 0))
-    # to [-1, 1]: v * 2 - 1
-    x = math('MULTIPLY_ADD', gin.outputs['Alpha'], 2.0, loc=(150, 250))
-    x.node.inputs[2].default_value = -1.0
-    y = math('MULTIPLY_ADD', g_flip, 2.0, loc=(150, 0))
-    y.node.inputs[2].default_value = -1.0
-    xx = math('MULTIPLY', x, x, loc=(300, 250))
-    yy = math('MULTIPLY', y, y, loc=(300, 0))
-    z = math('SQRT', math('SUBTRACT', math('SUBTRACT', 1.0, xx, loc=(450, 250)), yy, loc=(450, 100), clamp=True),
-             loc=(450, -50))
-    comb = N.new('ShaderNodeCombineColor'); comb.location = (550, 0)
-    for chan, v in (('Red', gin.outputs['Alpha']), ('Green', g_flip)):
-        L.new(v, comb.inputs[chan])
-    zc = math('MULTIPLY_ADD', z, 0.5, loc=(500, -200))
-    zc.node.inputs[2].default_value = 0.5
-    L.new(zc, comb.inputs['Blue'])
-    L.new(comb.outputs['Color'], gout.inputs['Normal Color'])
-    return ng
-
-
-def build_blender_material(name, layers, tex_map, report, normal_mode='raw'):
-    """Create a Principled-BSDF material wired to the converted PNG textures."""
-    mat = bpy.data.materials.get(name)
-    if mat is not None:
-        return mat
-    mat = bpy.data.materials.new(name)
-    mat.use_nodes = True
-    nt = mat.node_tree
-    bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
-
-    def tex_node(role, non_color=False, x=-600, y=0):
-        bmp = layers.get(role)
-        if not bmp:
-            return None
-        png = tex_map.get(norm_tex_key(bmp))
-        img = load_image(png, non_color)
-        if img is None:
-            report['missing_textures'].add(bmp)
-            return None
-        node = nt.nodes.new('ShaderNodeTexImage')
-        node.image = img
-        node.label = role
-        node.location = (x, y)
-        return node
-
-    diff = tex_node('diffuse', y=300)
-    if diff is not None:
-        nt.links.new(diff.outputs['Color'], bsdf.inputs['Base Color'])
-    elif layers.get('decal'):
-        dec = tex_node('decal', y=300)
-        if dec is not None:
-            nt.links.new(dec.outputs['Color'], bsdf.inputs['Base Color'])
-
-    alpha = tex_node('alpha', y=0)
-    if alpha is not None:
-        nt.links.new(alpha.outputs['Alpha'], bsdf.inputs['Alpha'])
-        mat.blend_method = 'HASHED' if hasattr(mat, 'blend_method') else None
-
-    spec = tex_node('specular', y=-300)
-    if spec is not None:
-        sock = bsdf.inputs.get('Specular Tint') or bsdf.inputs.get('Specular')
-        if sock is not None:
-            nt.links.new(spec.outputs['Color'], sock)
-
-    emis = tex_node('emissive', y=-600)
-    if emis is not None:
-        sock = bsdf.inputs.get('Emission Color') or bsdf.inputs.get('Emission')
-        if sock is not None:
-            nt.links.new(emis.outputs['Color'], sock)
-            if 'Emission Strength' in bsdf.inputs:
-                bsdf.inputs['Emission Strength'].default_value = 1.0
-
-    norm = tex_node('normal', non_color=True, y=-900)
-    if norm is not None:
-        nmap = nt.nodes.new('ShaderNodeNormalMap')
-        nmap.location = (-150, -900)
-        if normal_mode == 'raw':
-            # SC2 "DXT5nm" layout: X in alpha, Y in green, Z rebuilt - decode it in the shader
-            dec = nt.nodes.new('ShaderNodeGroup')
-            dec.node_tree = sc2_normal_decode_group()
-            dec.location = (-350, -900)
-            nt.links.new(norm.outputs['Color'], dec.inputs['Color'])
-            nt.links.new(norm.outputs['Alpha'], dec.inputs['Alpha'])
-            nt.links.new(dec.outputs['Normal Color'], nmap.inputs['Color'])
-        else:
-            nt.links.new(norm.outputs['Color'], nmap.inputs['Color'])
-        nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
-
-    # remaining layers: add unconnected image nodes so they are still visible in the .blend
-    y = -1200
-    for role in ('gloss', 'emissive2', 'envio', 'envio_mask', 'alpha2', 'height', 'lightmap', 'ao'):
-        if tex_node(role, non_color=True, y=y) is not None:
-            y -= 300
-    return mat
-
-
 # --------------------------------------------------------------------------------------
 # Animations
 # --------------------------------------------------------------------------------------
@@ -333,6 +123,10 @@ def fcurves_of(action):
         return out
 
 
+def is_layer_channel(path):
+    return path.startswith('m3_materiallayers[') and path.rsplit('.', 1)[-1] in sm.ANIMATED_LAYER_PROPS
+
+
 def is_bone_transform(path):
     return path.startswith('pose.bones[') and path.endswith(TRANSFORM_SUFFIXES)
 
@@ -344,18 +138,25 @@ def collect_sequences(ob):
     actions - one per sub-animation (STC), some running concurrently and keying only part of the
     skeleton. A COLLADA clip needs a fully defined skeleton, so per sequence we combine:
         bone defaults (DEFAULTS action)  <  sub-animations in ascending priority order.
-    Non-bone channels (material / particle properties) are dropped: COLLADA can't carry them.
+    Material-layer channels (scrolling UVs, brightness...) are collected separately in
+    'mat_channels' - COLLADA can't carry them, but the .blend can. Particle etc. are dropped.
 
-    Returns (defaults, sequences) where
-        defaults  = {(data_path, index): value}
-        sequences = [{'name', 'length', 'looping', 'source_frames', 'channels': {key: [(f, v, interp)]}}]
-    with frames in `channels` relative to the start of the sequence.
+    Returns (defaults, sequences, layer_defaults) where
+        defaults       = {(data_path, index): value}            bone channels
+        layer_defaults = {(data_path, index): value}            material-layer channels
+        sequences = [{'name', 'length', 'looping', 'source_frames',
+                      'channels': {key: [(f, v, interp)]}, 'mat_channels': {...}}]
+    with frames relative to the start of the sequence.
     """
-    defaults = {}
+    defaults, layer_defaults = {}, {}
     if ob.m3_animations_default:
         for fc in fcurves_of(ob.m3_animations_default):
-            if is_bone_transform(fc.data_path) and len(fc.keyframe_points):
+            if not len(fc.keyframe_points):
+                continue
+            if is_bone_transform(fc.data_path):
                 defaults[(fc.data_path, fc.array_index)] = fc.keyframe_points[0].co[1]
+            elif is_layer_channel(fc.data_path):
+                layer_defaults[(fc.data_path, fc.array_index)] = fc.keyframe_points[0].co[1]
     for pb in ob.pose.bones:  # anything missing from DEFAULTS falls back to the current pose
         for prop, n in BONE_CHANNELS:
             path = pb.path_from_id(prop)
@@ -367,10 +168,14 @@ def collect_sequences(ob):
         f0, f1 = int(g.frame_start), int(g.frame_end)
         if f1 <= f0:
             f1 = f0 + 1
-        channels = {}
+        channels, mat_channels = {}, {}
         for a in sorted([a for a in g.animations if a.action], key=lambda a: a.priority):
             for fc in fcurves_of(a.action):
-                if not is_bone_transform(fc.data_path):
+                if is_bone_transform(fc.data_path):
+                    target = channels
+                elif is_layer_channel(fc.data_path):
+                    target = mat_channels
+                else:
                     continue
                 n = len(fc.keyframe_points)
                 co = [0.0] * (2 * n)
@@ -380,15 +185,15 @@ def collect_sequences(ob):
                 pts = [(co[2 * i] - f0, co[2 * i + 1], ip[i]) for i in range(n)
                        if f0 - 0.001 <= co[2 * i] <= f1 + 0.001]
                 if pts:
-                    channels[(fc.data_path, fc.array_index)] = pts  # higher priority overrides
+                    target[(fc.data_path, fc.array_index)] = pts  # higher priority overrides
         name = (g.name or 'Anim').strip()
         base, k = name, 2
         while name in used:
             name, k = f'{base}_{k}', k + 1
         used.add(name)
         sequences.append({'name': name, 'length': f1 - f0, 'looping': not g.not_looping,
-                          'source_frames': [f0, f1], 'channels': channels})
-    return defaults, sequences
+                          'source_frames': [f0, f1], 'channels': channels, 'mat_channels': mat_channels})
+    return defaults, sequences, layer_defaults
 
 
 def build_action(name, defaults, placed):
@@ -640,6 +445,32 @@ def write_anim_list(path, model_name, clips, fps):
         f.write('\n'.join(lines) + '\n')
 
 
+def build_blend_materials(mesh_materials, tex_map, equirect, report, normal_mode, animated_paths,
+                          layer_defaults, placed):
+    """Swap the export (Principled) materials for SC2-style ones and animate their layers."""
+    built, targets_by_mat = {}, {}
+    for mob, name, m3mat, layers, mtype in mesh_materials:
+        if name not in built:
+            if mtype == 'm3_materials_standard' and m3mat is not None:
+                old = bpy.data.materials.get(name)
+                if old is not None:
+                    old.name = name + '_export'
+                mat, targets = sm.build_sc2_material(name, m3mat, layers, tex_map, equirect, report,
+                                                     normal_mode, animated_paths)
+                targets_by_mat[mat] = targets
+                built[name] = mat
+            else:
+                built[name] = bpy.data.materials.get(name)
+        mob.data.materials.clear()
+        mob.data.materials.append(built[name])
+    for m in list(bpy.data.materials):
+        if m.name.endswith('_export') and m.users == 0:
+            bpy.data.materials.remove(m)
+    if placed:
+        report['animated_materials'] = sm.build_material_actions(targets_by_mat, layer_defaults, placed,
+                                                                 build_action)
+
+
 def export_obj(path, meshes):
     for o in bpy.data.objects:
         o.select_set(False)
@@ -778,12 +609,17 @@ def convert_model(m3s, model, tex_map, opts):
         if o is not ob and o not in region_set:
             bpy.data.objects.remove(o, do_unlink=True)
 
+    defaults, sequences, layer_defaults = collect_sequences(ob) if get_anims else ({}, [], {})
+    animated_paths = {k[0] for seq in sequences for k in seq['mat_channels']}
+    normal_mode = opts.get('normal_maps', 'raw')
+
     model_stem = os.path.splitext(os.path.basename(model['dae']))[0]
     ob.name = model_stem
     ob.data.name = model_stem + '_Armature'
 
     # materials + mesh clean-up
     mat_cache = {}
+    mesh_materials = []   # (mesh, material name, m3 material, layers) for the .blend materials
     for i, mob in enumerate(region_meshes):
         mob.name = f'{model_stem}_Mesh{i:02d}'
         mob.data.name = mob.name
@@ -806,19 +642,19 @@ def convert_model(m3s, model, tex_map, opts):
             matref = shared.m3_pointer_get(ob.m3_materialrefs, batch.material)
             if matref is not None:
                 break
-        m3mat, mtype = m3_material_from_ref(ob, matref, shared) if matref else (None, None)
+        m3mat, mtype = sm.m3_material_from_ref(ob, matref, shared) if matref else (None, None)
         mat_name = matref.name if matref else f'{model_stem}_NoMaterial'
+        layers = sm.collect_layers(ob, m3mat, shared)
         if mat_name not in mat_cache:
-            layers = collect_layers(ob, m3mat, shared)
-            mat_cache[mat_name] = build_blender_material(mat_name, layers, tex_map, report,
-                                                          opts.get('normal_maps', 'raw'))
+            mat_cache[mat_name] = sm.build_export_material(mat_name, layers, tex_map, report,
+                                                           normal_mode, animated_paths)
         mob.data.materials.clear()
         mob.data.materials.append(mat_cache[mat_name])
+        mesh_materials.append((mob, mat_name, m3mat, layers, mtype))
 
     report['meshes'] = len(region_meshes)
     report['bones'] = len(ob.data.bones)
 
-    defaults, sequences = collect_sequences(ob) if get_anims else ({}, [])
     drop_m3studio_actions(ob)
     fps = bpy.context.scene.render.fps
 
@@ -845,6 +681,7 @@ def convert_model(m3s, model, tex_map, opts):
     # 1) main file: all sequences laid out end to end on one timeline
     clips = []
     timeline_act = None
+    placed = []
     if sequences and anim_mode in ('timeline', 'both'):
         placed, off = [], 0
         for seq in sequences:
@@ -890,6 +727,8 @@ def convert_model(m3s, model, tex_map, opts):
         export_obj(os.path.splitext(model['dae'])[0] + '.obj', region_meshes)
 
     if opts.get('save_blend'):
+        build_blend_materials(mesh_materials, tex_map, set(opts.get('equirect', [])), report, normal_mode,
+                              animated_paths, layer_defaults, placed if timeline_act else [])
         setup_viewer(ob, region_meshes, clips if timeline_act else [], timeline_act)
         blend_path = os.path.abspath(os.path.splitext(model['dae'])[0] + '.blend')
         # store texture paths relative to the .blend ("//Foo.png") so the folder can be moved/shared
@@ -942,7 +781,8 @@ def main(argv):
         results['textures'] = convert_textures_with_blender(job['texture_fallback'])
 
     m3s = load_m3studio(job['m3studio'])
-    opts = job.get('options', {})
+    opts = dict(job.get('options', {}))
+    opts['equirect'] = [norm_tex_key(k) for k in job.get('equirect', [])]
     tex_map = {norm_tex_key(k): v for k, v in job.get('textures', {}).items()}
 
     for model in job.get('models', []):

@@ -1,0 +1,733 @@
+"""
+Blender materials for StarCraft II (.m3) models. Imported by blender_convert.py, runs inside Blender.
+
+Two kinds of material are built:
+
+* export materials - a plain Principled BSDF that Blender's COLLADA / OBJ exporters understand.
+  Only textures that use the first UV set with no UV transform are wired in, because those formats
+  can't express anything else (a decal on UV set 2 would otherwise be mapped with the wrong UVs).
+
+* SC2 materials - used in the saved .blend. They mimic SC2's (pre-PBR) shading instead:
+      Lambert diffuse (diffuse map, team colour, decal)
+    + coloured specular highlight (specular map x HDR spec, roughness from "specularity" / gloss map)
+    + environment reflection (envio map looked up by the reflection vector, x envio mask)
+    + emissive layers
+  with per-layer UV sources (UV sets 1-4, planar/tri-planar, reflection, screen), UV transforms,
+  channel selection, fresnel, alpha masks and blend modes, and layer animations (scrolling /
+  rotating UVs, brightness) keyed on the same timeline as the skeleton.
+"""
+import os
+
+import bpy
+
+# M3 standard-material layer slot -> role
+LAYER_ROLES = [
+    ('layer_diff', 'diffuse'),
+    ('layer_decal', 'decal'),
+    ('layer_spec', 'specular'),
+    ('layer_gloss', 'gloss'),
+    ('layer_emis1', 'emissive'),
+    ('layer_emis2', 'emissive2'),
+    ('layer_envi', 'envio'),
+    ('layer_envi_mask', 'envio_mask'),
+    ('layer_alpha1', 'alpha'),
+    ('layer_alpha2', 'alpha2'),
+    ('layer_norm', 'normal'),
+    ('layer_height', 'height'),
+    ('layer_light', 'lightmap'),
+    ('layer_ao', 'ao'),
+]
+UV_SET = {'UV0': 'uv0', 'UV1': 'uv1', 'UV2': 'uv2', 'UV3': 'uv3', 'PARTICLE': 'uv0'}
+ENV_SOURCES = {'REFCUBE', 'REFSPHERE', 'CUBE', 'SPHERE'}
+ANIMATED_LAYER_PROPS = ('uv_offset', 'uv_angle', 'uv_tiling', 'color_brightness', 'color_multiply',
+                        'color_add', 'color_value')
+TEAM_COLOR_LINEAR = (0.47, 0.006, 0.012, 1.0)   # SC2 player-1 red
+
+
+def norm_tex_key(path):
+    return path.replace('/', '\\').strip().lower()
+
+
+# --------------------------------------------------------------------------------------
+# Reading the M3 material
+# --------------------------------------------------------------------------------------
+
+def m3_material_from_ref(ob, matref, shared, depth=0):
+    """Resolve an M3 material reference to (material, type) - following composite materials."""
+    if matref is None or depth > 4:
+        return None, None
+    coll = getattr(ob, matref.mat_type, None)
+    if coll is None:
+        return None, None
+    mat = shared.m3_pointer_get(coll, matref.mat_handle)
+    if mat is None:
+        return None, None
+    if matref.mat_type == 'm3_materials_composite':
+        for section in mat.sections:
+            sub = shared.m3_pointer_get(ob.m3_materialrefs, section.material)
+            m, t = m3_material_from_ref(ob, sub, shared, depth + 1)
+            if m is not None:
+                return m, t
+        return None, None
+    return mat, matref.mat_type
+
+
+def collect_layers(ob, m3mat, shared):
+    """{role: M3 layer} for the layers of a material that carry a bitmap or a constant colour."""
+    out = {}
+    if m3mat is None:
+        return out
+    roles = list(LAYER_ROLES)
+    if not any(hasattr(m3mat, a) for a, _ in roles):   # terrain / volume / creep ... materials
+        roles = [(a, 'diffuse') for a in dir(m3mat) if a.startswith('layer_')]
+    for attr, role in roles:
+        handle = getattr(m3mat, attr, None)
+        if not isinstance(handle, str) or not handle or role in out:
+            continue
+        layer = shared.m3_pointer_get(ob.m3_materiallayers, handle)
+        if layer is None:
+            continue
+        if layer_bitmap(layer) or getattr(layer, 'color_type', 'BITMAP') == 'COLOR':
+            out[role] = layer
+    return out
+
+
+def layer_bitmap(layer):
+    if getattr(layer, 'color_type', 'BITMAP') != 'BITMAP':
+        return ''
+    return (getattr(layer, 'color_bitmap', '') or '').strip()
+
+
+def layer_path(layer):
+    return layer.path_from_id()          # e.g. 'm3_materiallayers[3]'
+
+
+def layer_uv_is_plain(layer, animated_paths=()):
+    """True when the layer samples UV set 1 with an identity, non-animated UV transform."""
+    if layer.uv_source not in ('UV0', 'PARTICLE'):
+        return False
+    if any(abs(v) > 1e-6 for v in layer.uv_offset) or any(abs(v - 1) > 1e-6 for v in layer.uv_tiling) \
+            or any(abs(v) > 1e-6 for v in layer.uv_angle) or layer.uv_flipbook_rows > 1 or layer.uv_flipbook_cols > 1:
+        return False
+    lp = layer_path(layer)
+    return not any(p.startswith(lp + '.uv_') for p in animated_paths)
+
+
+def load_image(png_path, non_color=False):
+    if not png_path or not os.path.isfile(png_path):
+        return None
+    img = bpy.data.images.load(os.path.abspath(png_path), check_existing=True)
+    img.alpha_mode = 'CHANNEL_PACKED'      # SC2 alpha channels are data (team colour, normal X...)
+    if non_color:
+        try:
+            img.colorspace_settings.name = 'Non-Color'
+        except TypeError:
+            pass
+    return img
+
+
+# --------------------------------------------------------------------------------------
+# Shared node groups
+# --------------------------------------------------------------------------------------
+
+def _math(nt, op, a, b=None, loc=(0, 0), clamp=False, c=None):
+    n = nt.nodes.new('ShaderNodeMath')
+    n.operation = op
+    n.location = loc
+    n.use_clamp = clamp
+    for i, v in enumerate((a, b, c)):
+        if v is None:
+            continue
+        if isinstance(v, (int, float)):
+            n.inputs[i].default_value = v
+        else:
+            nt.links.new(v, n.inputs[i])
+    return n.outputs[0]
+
+
+def sc2_normal_decode_group():
+    """SC2 "DXT5nm" normal texture (X in alpha, Y in green) -> standard tangent-space normal colour.
+    SC2 normal maps are DirectX-style (green points down), so 'Flip Green' defaults to 1."""
+    name = 'SC2 Normal Decode (DXT5nm)'
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
+    iface = ng.interface
+    iface.new_socket('Color', in_out='INPUT', socket_type='NodeSocketColor')
+    iface.new_socket('Alpha', in_out='INPUT', socket_type='NodeSocketFloat')
+    flip = iface.new_socket('Flip Green', in_out='INPUT', socket_type='NodeSocketFloat')
+    flip.default_value, flip.min_value, flip.max_value = 1.0, 0.0, 1.0
+    iface.new_socket('Normal Color', in_out='OUTPUT', socket_type='NodeSocketColor')
+    N, L = ng.nodes, ng.links
+    gin, gout = N.new('NodeGroupInput'), N.new('NodeGroupOutput')
+    gin.location, gout.location = (-900, 0), (700, 0)
+    sep = N.new('ShaderNodeSeparateColor')
+    sep.location = (-700, 100)
+    L.new(gin.outputs['Color'], sep.inputs['Color'])
+    g = sep.outputs['Green']
+    one_minus_2g = _math(ng, 'MULTIPLY_ADD', g, -2.0, c=1.0, loc=(-500, -150))          # 1 - 2g
+    g_flip = _math(ng, 'ADD', g, _math(ng, 'MULTIPLY', gin.outputs['Flip Green'], one_minus_2g,
+                                       loc=(-300, -100)), loc=(-100, 0))               # g or 1-g
+    x = _math(ng, 'MULTIPLY_ADD', gin.outputs['Alpha'], 2.0, c=-1.0, loc=(150, 250))
+    y = _math(ng, 'MULTIPLY_ADD', g_flip, 2.0, c=-1.0, loc=(150, 0))
+    xx = _math(ng, 'MULTIPLY', x, x, loc=(300, 250))
+    yy = _math(ng, 'MULTIPLY', y, y, loc=(300, 0))
+    z = _math(ng, 'SQRT', _math(ng, 'SUBTRACT', _math(ng, 'SUBTRACT', 1.0, xx, loc=(450, 250)), yy,
+                                loc=(450, 100), clamp=True), loc=(450, -50))
+    comb = N.new('ShaderNodeCombineColor')
+    comb.location = (550, 0)
+    L.new(gin.outputs['Alpha'], comb.inputs['Red'])
+    L.new(g_flip, comb.inputs['Green'])
+    L.new(_math(ng, 'MULTIPLY_ADD', z, 0.5, c=0.5, loc=(500, -200)), comb.inputs['Blue'])
+    L.new(comb.outputs['Color'], gout.inputs['Normal Color'])
+    return ng
+
+
+SETTINGS_OUTPUTS = (('Team Color', 'NodeSocketColor', TEAM_COLOR_LINEAR),
+                    ('Specular Strength', 'NodeSocketFloat', 1.0),
+                    ('Reflection Strength', 'NodeSocketFloat', 1.0),
+                    ('Emission Strength', 'NodeSocketFloat', 1.0))
+
+
+def settings_group():
+    """One node group shared by every material: team colour and global strength multipliers.
+    Edit the values inside it once and the whole model follows (1.0 = the model's own values)."""
+    name = 'SC2 Settings'
+    ng = bpy.data.node_groups.get(name)
+    if ng is not None:
+        return ng
+    ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
+    out = ng.nodes.new('NodeGroupOutput')
+    out.location = (300, 0)
+    for i, (label, kind, default) in enumerate(SETTINGS_OUTPUTS):
+        ng.interface.new_socket(label, in_out='OUTPUT', socket_type=kind)
+        if kind == 'NodeSocketColor':
+            n = ng.nodes.new('ShaderNodeRGB')
+        else:
+            n = ng.nodes.new('ShaderNodeValue')
+        n.label = label + ' (edit me)'
+        n.outputs[0].default_value = default
+        n.location = (0, -i * 200)
+        ng.links.new(n.outputs[0], out.inputs[label])
+    return ng
+
+
+# --------------------------------------------------------------------------------------
+# Export material (Principled) - for COLLADA / OBJ
+# --------------------------------------------------------------------------------------
+
+def build_export_material(name, layers, tex_map, report, normal_mode='raw', animated_paths=()):
+    mat = bpy.data.materials.get(name)
+    if mat is not None:
+        return mat
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nt = mat.node_tree
+    bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
+
+    def tex_node(role, non_color=False, y=0):
+        layer = layers.get(role)
+        if layer is None or not layer_bitmap(layer):
+            return None
+        png = tex_map.get(norm_tex_key(layer_bitmap(layer)))
+        img = load_image(png, non_color)
+        if img is None:
+            report['missing_textures'].add(layer_bitmap(layer))
+            return None
+        if not layer_uv_is_plain(layer, animated_paths):
+            report.setdefault('not_in_export', []).append(f'{name}:{role}')
+            return None   # COLLADA/OBJ can't express this layer's UVs - keep it out of them
+        node = nt.nodes.new('ShaderNodeTexImage')
+        node.image = img
+        node.label = role
+        node.location = (-600, y)
+        return node
+
+    diff = tex_node('diffuse', y=300) or tex_node('decal', y=300)
+    if diff is not None:
+        nt.links.new(diff.outputs['Color'], bsdf.inputs['Base Color'])
+    emis = tex_node('emissive', y=-600)
+    if emis is not None:
+        nt.links.new(emis.outputs['Color'], bsdf.inputs['Emission Color'])
+        bsdf.inputs['Emission Strength'].default_value = 1.0
+    if normal_mode == 'rgb':   # only a regular normal map is meaningful to other programs
+        norm = tex_node('normal', non_color=True, y=-900)
+        if norm is not None:
+            nmap = nt.nodes.new('ShaderNodeNormalMap')
+            nmap.location = (-250, -900)
+            nt.links.new(norm.outputs['Color'], nmap.inputs['Color'])
+            nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
+    return mat
+
+
+# --------------------------------------------------------------------------------------
+# SC2 material - for the .blend
+# --------------------------------------------------------------------------------------
+
+class SC2MaterialBuilder:
+    def __init__(self, name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths):
+        self.name, self.m3mat, self.layers = name, m3mat, layers
+        self.tex_map, self.equirect, self.report = tex_map, equirect, report
+        self.normal_mode, self.animated = normal_mode, set(animated_paths)
+        self.targets = []     # (m3 data path, m3 index, socket, socket index or None)
+        self.y = 0
+        self._settings = None
+
+    # ---- helpers
+    def node(self, kind, x=-400, **props):
+        n = self.nt.nodes.new(kind)
+        n.location = (x, self.y)
+        for k, v in props.items():
+            setattr(n, k, v)
+        return n
+
+    def link(self, a, b):
+        self.nt.links.new(a, b)
+
+    def math(self, op, a, b=None, c=None, clamp=False):
+        return _math(self.nt, op, a, b, c=c, loc=(-300, self.y), clamp=clamp)
+
+    def vmath(self, op, a, b=None, scale=None):
+        n = self.node('ShaderNodeVectorMath', -250, operation=op)
+        for i, v in enumerate((a, b)):
+            if v is None:
+                continue
+            if isinstance(v, (tuple, list)):
+                n.inputs[i].default_value = v
+            else:
+                self.link(v, n.inputs[i])
+        if scale is not None:
+            if isinstance(scale, (int, float)):
+                n.inputs['Scale'].default_value = scale
+            else:
+                self.link(scale, n.inputs['Scale'])
+        return n
+
+    def mix(self, blend, fac, a, b):
+        n = self.node('ShaderNodeMix', -150, data_type='RGBA', blend_type=blend)
+        for sock, v in ((n.inputs[0], fac), (n.inputs[6], a), (n.inputs[7], b)):
+            if isinstance(v, (int, float)):
+                sock.default_value = v
+            elif isinstance(v, tuple):
+                sock.default_value = v
+            else:
+                self.link(v, sock)
+        return n.outputs[2]
+
+    def is_animated(self, layer, prop):
+        return f'{layer_path(layer)}.{prop}' in self.animated
+
+    def setting(self, name):
+        if self._settings is None:
+            self._settings = self.node('ShaderNodeGroup', -1300)
+            self._settings.node_tree = settings_group()
+            self._settings.label = 'SC2 Settings (shared)'
+        return self._settings.outputs[name]
+
+    def team_color(self):
+        return self.setting('Team Color')
+
+    # ---- layer sampling
+    def uv_vector(self, layer):
+        """Vector socket for an image lookup, or None for the default UV set with no transform."""
+        src = layer.uv_source
+        vec = None
+        if src in UV_SET:
+            if src not in ('UV0', 'PARTICLE'):
+                vec = self.node('ShaderNodeUVMap', -1100, uv_map=UV_SET[src]).outputs['UV']
+        elif src.startswith('PLANAR') or src.startswith('TRIPLANAR'):
+            tc = self.node('ShaderNodeTexCoord', -1100)
+            vec = tc.outputs['Object'] if ('L' in src[6:]) else self.node(
+                'ShaderNodeNewGeometry', -1100).outputs['Position']
+            axis = src[-1] if src[-1] in 'XYZ' and src.startswith('PLANAR') else 'Z'
+            if src.startswith('PLANAR') and axis != 'Z':   # project along the axis
+                order = {'X': (1, 2, 0), 'Y': (0, 2, 1)}[axis]
+                sep = self.node('ShaderNodeSeparateXYZ', -1000)
+                self.link(vec, sep.inputs[0])
+                comb = self.node('ShaderNodeCombineXYZ', -900)
+                for i, o in enumerate(order):
+                    self.link(sep.outputs[o], comb.inputs[i])
+                vec = comb.outputs[0]
+        elif src == 'SCREEN':
+            vec = self.node('ShaderNodeTexCoord', -1100).outputs['Window']
+
+        uv_anim = any(self.is_animated(layer, p) for p in ('uv_offset', 'uv_angle', 'uv_tiling'))
+        identity = (all(abs(v) < 1e-6 for v in layer.uv_offset) and all(abs(v - 1) < 1e-6 for v in layer.uv_tiling)
+                    and all(abs(v) < 1e-6 for v in layer.uv_angle))
+        if identity and not uv_anim:
+            return vec
+        if vec is None:
+            vec = self.node('ShaderNodeUVMap', -1100, uv_map='uv0').outputs['UV']
+        # M3 texture space has V pointing down: flip into it, apply offset/rotation/tiling, flip back
+        flip_in = self.node('ShaderNodeMapping', -950, vector_type='POINT')
+        flip_in.inputs['Location'].default_value = (0, 1, 0)
+        flip_in.inputs['Scale'].default_value = (1, -1, 1)
+        self.link(vec, flip_in.inputs['Vector'])
+        m = self.node('ShaderNodeMapping', -800, vector_type='POINT', label='M3 UV transform')
+        m.inputs['Location'].default_value = (layer.uv_offset[0], layer.uv_offset[1], 0)
+        m.inputs['Rotation'].default_value = tuple(layer.uv_angle)
+        m.inputs['Scale'].default_value = (layer.uv_tiling[0], layer.uv_tiling[1], 1)
+        self.link(flip_in.outputs[0], m.inputs['Vector'])
+        lp = layer_path(layer)
+        for i in range(2):
+            self.targets.append((lp + '.uv_offset', i, m.inputs['Location'], i))
+            self.targets.append((lp + '.uv_tiling', i, m.inputs['Scale'], i))
+        for i in range(3):
+            self.targets.append((lp + '.uv_angle', i, m.inputs['Rotation'], i))
+        flip_out = self.node('ShaderNodeMapping', -650, vector_type='POINT')
+        flip_out.inputs['Location'].default_value = (0, 1, 0)
+        flip_out.inputs['Scale'].default_value = (1, -1, 1)
+        self.link(m.outputs[0], flip_out.inputs['Vector'])
+        return flip_out.outputs[0]
+
+    def sample(self, role, non_color=False):
+        """Returns {'rgb', 'alpha', 'gray'} sockets for a layer (after channel selection, invert,
+        brightness and fresnel), or None if the layer is absent or its texture is missing."""
+        layer = self.layers.get(role)
+        if layer is None:
+            return None
+        self.y -= 350
+        lp = layer_path(layer)
+        if getattr(layer, 'color_type', 'BITMAP') == 'COLOR' or not layer_bitmap(layer):
+            rgbn = self.node('ShaderNodeRGB', -500, label=f'{role} colour')
+            rgbn.outputs[0].default_value = tuple(layer.color_value[:3]) + (1.0,)
+            for i in range(3):
+                self.targets.append((lp + '.color_value', i, rgbn.outputs[0], i))
+            rgb, alpha = rgbn.outputs[0], None
+            alpha_val = layer.color_value[3]
+        else:
+            png = self.tex_map.get(norm_tex_key(layer_bitmap(layer)))
+            img = load_image(png, non_color)
+            if img is None:
+                self.report['missing_textures'].add(layer_bitmap(layer))
+                return None
+            vec = None if layer.uv_source in ENV_SOURCES else self.uv_vector(layer)
+            tex = self.node('ShaderNodeTexImage', -550, image=img, label=role)
+            if not (layer.uv_wrap_x and layer.uv_wrap_y):
+                tex.extension = 'EXTEND'
+            if layer.uv_source.startswith('TRIPLANAR'):
+                tex.projection = 'BOX'
+                tex.projection_blend = 0.2
+            if vec is not None:
+                self.link(vec, tex.inputs['Vector'])
+            rgb, alpha, alpha_val = tex.outputs['Color'], tex.outputs['Alpha'], None
+
+        # channel selection
+        ch = layer.color_channels
+        gray = None
+        if ch in ('R', 'G', 'B'):
+            sep = self.node('ShaderNodeSeparateColor', -350)
+            self.link(rgb, sep.inputs[0])
+            gray = sep.outputs[{'R': 0, 'G': 1, 'B': 2}[ch]]
+        elif ch == 'A':
+            gray = alpha if alpha is not None else self.math('ADD', alpha_val or 1.0, 0.0)
+        if gray is not None:
+            comb = self.node('ShaderNodeCombineColor', -300)
+            for i in range(3):
+                self.link(gray, comb.inputs[i])
+            rgb = comb.outputs[0]
+        else:
+            gray = self.node('ShaderNodeRGBToBW', -300)
+            self.link(rgb, gray.inputs[0])
+            gray = gray.outputs[0]
+
+        if layer.color_invert:
+            inv = self.node('ShaderNodeInvert', -250)
+            self.link(rgb, inv.inputs['Color'])
+            rgb = inv.outputs[0]
+            gray = self.math('SUBTRACT', 1.0, gray)
+
+        # brightness x multiplier (+ add), animatable
+        for prop, default in (('color_brightness', 1.0), ('color_multiply', 1.0)):
+            val = getattr(layer, prop)
+            if abs(val - default) > 1e-6 or self.is_animated(layer, prop):
+                v = self.vmath('SCALE', rgb, scale=val)
+                rgb = v.outputs[0]
+                self.targets.append((f'{lp}.{prop}', 0, v.inputs['Scale'], None))
+        if abs(layer.color_add) > 1e-6 or self.is_animated(layer, 'color_add'):
+            addn = self.math('ADD', 0.0, layer.color_add)
+            self.targets.append((f'{lp}.color_add', 0, addn.node.inputs[1], None))
+            comb = self.node('ShaderNodeCombineXYZ', -200)
+            for i in range(3):
+                self.link(addn, comb.inputs[i])
+            rgb = self.vmath('ADD', rgb, comb.outputs[0]).outputs[0]
+
+        # fresnel: strength from view angle
+        if layer.fresnel_type != 'DISABLED':
+            lw = self.node('ShaderNodeLayerWeight', -350)
+            lw.inputs['Blend'].default_value = 0.5
+            f = self.math('POWER', lw.outputs['Facing'], max(layer.fresnel_exponent, 0.01))
+            if layer.fresnel_type == 'INVERTED':
+                f = self.math('SUBTRACT', 1.0, f)
+            f = self.math('MULTIPLY_ADD', f, layer.fresnel_max - layer.fresnel_min, c=layer.fresnel_min)
+            rgb = self.vmath('SCALE', rgb, scale=f).outputs[0]
+            gray = self.math('MULTIPLY', gray, f)
+        if alpha is None:
+            alpha = self.math('ADD', alpha_val if alpha_val is not None else 1.0, 0.0)
+        return {'rgb': rgb, 'alpha': alpha, 'gray': gray, 'layer': layer}
+
+    def env_lookup(self, role):
+        """Environment reflection: envio texture sampled with the reflection vector."""
+        layer = self.layers.get(role)
+        if layer is None or not layer_bitmap(layer):
+            return None
+        png = self.tex_map.get(norm_tex_key(layer_bitmap(layer)))
+        img = load_image(png)
+        if img is None:
+            self.report['missing_textures'].add(layer_bitmap(layer))
+            return None
+        self.y -= 350
+        tc = self.node('ShaderNodeTexCoord', -900)
+        env = self.node('ShaderNodeTexEnvironment', -550, image=img, label='envio (reflection)')
+        is_equirect = norm_tex_key(layer_bitmap(layer)) in self.equirect
+        env.projection = 'EQUIRECTANGULAR' if is_equirect else 'MIRROR_BALL'
+        self.link(tc.outputs['Reflection'], env.inputs['Vector'])
+        rgb = env.outputs['Color']
+        b = layer.color_brightness * layer.color_multiply
+        if abs(b - 1) > 1e-6:
+            rgb = self.vmath('SCALE', rgb, scale=b).outputs[0]
+        if layer.fresnel_type != 'DISABLED':
+            lw = self.node('ShaderNodeLayerWeight', -350)
+            f = self.math('POWER', lw.outputs['Facing'], max(layer.fresnel_exponent, 0.01))
+            if layer.fresnel_type == 'INVERTED':
+                f = self.math('SUBTRACT', 1.0, f)
+            f = self.math('MULTIPLY_ADD', f, layer.fresnel_max - layer.fresnel_min, c=layer.fresnel_min)
+            rgb = self.vmath('SCALE', rgb, scale=f).outputs[0]
+        return rgb
+
+    # ---- assembly
+    def build(self):
+        mat = bpy.data.materials.new(self.name)
+        mat.use_nodes = True
+        self.nt = nt = mat.node_tree
+        for n in list(nt.nodes):
+            nt.nodes.remove(n)
+        out = self.node('ShaderNodeOutputMaterial', 900)
+        m = self.m3mat
+
+        # --- base colour
+        diff = self.sample('diffuse')
+        if diff is not None:
+            base = diff['rgb']
+            if diff['layer'].color_channels == 'ARGB':   # alpha = team-colour mask
+                base = self.mix('MIX', diff['alpha'], self.team_color(), base)
+        else:
+            base = (0.0, 0.0, 0.0, 1.0)
+        dec = self.sample('decal')
+        if dec is not None:
+            base = self.mix('SCREEN', dec['alpha'], base, dec['rgb'])
+        if getattr(m, 'vertex_color', False):
+            attr = self.node('ShaderNodeVertexColor', -400, layer_name='m3color')
+            base = self.mix('MULTIPLY', 1.0, base, attr.outputs['Color'])
+        if isinstance(base, tuple):
+            rgbn = self.node('ShaderNodeRGB', -300)
+            rgbn.outputs[0].default_value = base
+            base = rgbn.outputs[0]
+
+        # --- normal map
+        normal = None
+        nrm = self.sample('normal', non_color=True)
+        if nrm is not None:
+            self.y -= 100
+            nmap = self.node('ShaderNodeNormalMap', 0, uv_map=UV_SET.get(nrm['layer'].uv_source, 'uv0'))
+            if self.normal_mode == 'raw':
+                g = self.node('ShaderNodeGroup', -150)
+                g.node_tree = sc2_normal_decode_group()
+                tex_color = nrm['rgb']
+                self.link(tex_color, g.inputs['Color'])
+                self.link(nrm['alpha'], g.inputs['Alpha'])
+                self.link(g.outputs['Normal Color'], nmap.inputs['Color'])
+            else:
+                self.link(nrm['rgb'], nmap.inputs['Color'])
+            normal = nmap.outputs['Normal']
+
+        self.y = 600
+        if getattr(m, 'unshaded', False):
+            shader = self.node('ShaderNodeEmission', 300)
+            self.link(base, shader.inputs['Color'])
+            shader = shader.outputs[0]
+        else:
+            dif = self.node('ShaderNodeBsdfDiffuse', 300)
+            self.link(base, dif.inputs['Color'])
+            if normal is not None:
+                self.link(normal, dif.inputs['Normal'])
+            shader = dif.outputs[0]
+
+            # --- specular highlight (SC2: Blinn-Phong, colour = specular map x HDR spec)
+            self.y = 0
+            spec = self.sample('specular')
+            if spec is not None:
+                srgb = spec['gray'] if getattr(m, 'spec_mode', 'RGB') == 'A' else spec['rgb']
+                hdr = getattr(m, 'hdr_spec', 1.0)
+                if abs(hdr - 1) > 1e-6:
+                    srgb = self.vmath('SCALE', srgb, scale=hdr).outputs[0]
+                srgb = self.vmath('SCALE', srgb, scale=self.setting('Specular Strength')).outputs[0]
+                n_exp = max(getattr(m, 'specularity', 20.0) or 20.0, 1.0)
+                gloss = self.sample('gloss')
+                n_sock = self.math('MULTIPLY', gloss['gray'], n_exp) if gloss else None
+                # Blinn-Phong exponent n -> GGX roughness: alpha = sqrt(2 / (n + 2)), roughness = sqrt(alpha)
+                if n_sock is not None:
+                    rough = self.math('POWER', self.math('DIVIDE', 2.0, self.math('ADD', self.math(
+                        'MAXIMUM', n_sock, 1.0), 2.0)), 0.25)
+                else:
+                    rough = (2.0 / (n_exp + 2.0)) ** 0.25
+                gl = self.node('ShaderNodeBsdfGlossy', 300,
+                               distribution='GGX')
+                self.link(srgb, gl.inputs['Color'])
+                if isinstance(rough, float):
+                    gl.inputs['Roughness'].default_value = rough
+                else:
+                    self.link(rough, gl.inputs['Roughness'])
+                if normal is not None:
+                    self.link(normal, gl.inputs['Normal'])
+                add = self.node('ShaderNodeAddShader', 500)
+                self.link(shader, add.inputs[0])
+                self.link(gl.outputs[0], add.inputs[1])
+                shader = add.outputs[0]
+
+        # --- emissive + environment reflection, added on top (as in SC2)
+        self.y = -2000
+        glow = []
+        for role, mode_attr in (('emissive', 'blend_mode_emis1'), ('emissive2', 'blend_mode_emis2')):
+            e = self.sample(role)
+            if e is None:
+                continue
+            mode = getattr(m, mode_attr, 'ADD')
+            if mode == 'TEAMEMIS':
+                glow.append(self.mix('MULTIPLY', 1.0, self.team_color(), e['rgb']))
+            elif mode == 'TEAMDIFF':
+                glow.append(self.mix('MULTIPLY', 1.0, self.team_color(), e['rgb']))
+            else:
+                glow.append(e['rgb'])
+        hdr_emis = getattr(m, 'hdr_emis', 1.0)
+        env = self.env_lookup('envio')
+        if env is not None:
+            mask = self.sample('envio_mask')
+            if mask is not None:
+                env = self.vmath('SCALE', env, scale=mask['gray']).outputs[0]
+            k = getattr(m, 'hdr_envi_const', 1.0)
+            if abs(k - 1) > 1e-6:
+                env = self.vmath('SCALE', env, scale=k).outputs[0]
+        if glow or env is not None:
+            total = None
+            for g in glow:
+                total = g if total is None else self.vmath('ADD', total, g).outputs[0]
+            if total is not None and abs(hdr_emis - 1) > 1e-6:
+                total = self.vmath('SCALE', total, scale=hdr_emis).outputs[0]
+            if total is not None:
+                total = self.vmath('SCALE', total, scale=self.setting('Emission Strength')).outputs[0]
+            if env is not None:
+                env = self.vmath('SCALE', env, scale=self.setting('Reflection Strength')).outputs[0]
+                total = env if total is None else self.vmath('ADD', total, env).outputs[0]
+            em = self.node('ShaderNodeEmission', 300)
+            self.link(total, em.inputs['Color'])
+            add = self.node('ShaderNodeAddShader', 600)
+            self.link(shader, add.inputs[0])
+            self.link(em.outputs[0], add.inputs[1])
+            shader = add.outputs[0]
+
+        # --- transparency / blend mode
+        self.y = -2600
+        alpha = None
+        for role in ('alpha', 'alpha2'):
+            a = self.sample(role)
+            if a is not None:
+                alpha = a['gray'] if alpha is None else self.math('MULTIPLY', alpha, a['gray'])
+        if getattr(m, 'vertex_alpha', False):
+            attr = self.node('ShaderNodeVertexColor', -400, layer_name='m3color')
+            alpha = attr.outputs['Alpha'] if alpha is None else self.math('MULTIPLY', alpha, attr.outputs['Alpha'])
+        blend = getattr(m, 'blend_mode', 'OPAQUE')
+        if blend in ('ADD', 'ALPHAA'):
+            # additive: the surface only adds light
+            black = self.node('ShaderNodeEmission', 400)
+            black.inputs['Color'].default_value = (0, 0, 0, 1)
+            if alpha is not None:
+                mixn = self.node('ShaderNodeMixShader', 600)
+                self.link(alpha, mixn.inputs[0])
+                self.link(black.outputs[0], mixn.inputs[1])
+                self.link(shader, mixn.inputs[2])
+                shader = mixn.outputs[0]
+            tr = self.node('ShaderNodeBsdfTransparent', 600)
+            add = self.node('ShaderNodeAddShader', 750)
+            self.link(tr.outputs[0], add.inputs[0])
+            self.link(shader, add.inputs[1])
+            shader = add.outputs[0]
+            self._blended(mat)
+        elif alpha is not None:
+            if blend == 'ALPHAB':
+                fac = alpha
+                self._blended(mat)
+            else:   # opaque with alpha-test cut-out
+                thr = (getattr(m, 'alpha_test_threshold', 0) or 128) / 255.0
+                fac = self.math('GREATER_THAN', alpha, thr - 1e-4)
+            tr = self.node('ShaderNodeBsdfTransparent', 600)
+            mixn = self.node('ShaderNodeMixShader', 750)
+            self.link(fac, mixn.inputs[0])
+            self.link(tr.outputs[0], mixn.inputs[1])
+            self.link(shader, mixn.inputs[2])
+            shader = mixn.outputs[0]
+        self.link(shader, out.inputs['Surface'])
+        mat.use_backface_culling = not getattr(m, 'two_sided', False)
+        mat['sc2rip_m3_blend_mode'] = blend
+        return mat
+
+    @staticmethod
+    def _blended(mat):
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED'
+        elif hasattr(mat, 'blend_method'):
+            mat.blend_method = 'BLEND'
+
+
+def build_sc2_material(name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths):
+    b = SC2MaterialBuilder(name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths)
+    mat = b.build()
+    return mat, b.targets
+
+
+# --------------------------------------------------------------------------------------
+# Layer animation -> node animation
+# --------------------------------------------------------------------------------------
+
+def socket_path(socket):
+    return socket.path_from_id('default_value')
+
+
+def build_material_actions(targets_by_mat, layer_defaults, placed, build_action):
+    """Key the node sockets that mirror animated M3 layer properties, on the model's timeline.
+
+    targets_by_mat: {material: [(m3_path, m3_index, socket, socket_index)]}
+    layer_defaults: {(m3_path, m3_index): value}
+    placed:         [(sequence, frame_offset)] - sequences carry 'mat_channels'
+    build_action:   blender_convert.build_action(name, defaults, placed)
+    """
+    made = 0
+    for mat, targets in targets_by_mat.items():
+        defaults_t, keymap = {}, {}
+        for m3_path, m3_idx, sock, s_idx in targets:
+            key_old = (m3_path, m3_idx)
+            if not any(key_old in seq['mat_channels'] for seq, _ in placed):
+                continue
+            key_new = (socket_path(sock), s_idx if s_idx is not None else 0)
+            keymap[key_new] = key_old
+            dv = sock.default_value
+            cur = dv[s_idx] if s_idx is not None else dv
+            defaults_t[key_new] = layer_defaults.get(key_old, cur)
+        if not keymap:
+            continue
+        placed_t = []
+        for seq, off in placed:
+            ch = {kn: seq['mat_channels'][ko] for kn, ko in keymap.items() if ko in seq['mat_channels']}
+            placed_t.append((dict(seq, channels=ch), off))
+        nt = mat.node_tree
+        act = build_action(f'{mat.name}_LayerAnims', defaults_t, placed_t)
+        nt.animation_data_create()
+        nt.animation_data.action = act
+        try:
+            if nt.animation_data.action_slot is None and len(act.slots):
+                nt.animation_data.action_slot = act.slots[0]
+        except AttributeError:
+            pass
+        made += 1
+    return made
