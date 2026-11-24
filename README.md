@@ -60,7 +60,7 @@ Alternatively, instead of Blender itself you can use the `bpy` module from pip. 
   cmake -B build -DCASC_BUILD_SHARED_LIB=ON && cmake --build build --config Release
   ```
   Then copy `build\Release\casc.dll` into `tools\casclib\` (or pass `--casclib path\to\casc.dll`).
-* **Linux**: `tools/casclib/libcasc.so` is included, or build it the same way.
+* **Linux**: `tools/casclib/libcasc.so` is included (x86-64, same commit). It needs only glibc ≥ 2.16 and has the C++ runtime built in, so it runs on any mainstream distro from the last decade (Ubuntu/Pop!_OS 22.04 included). Or build it the same way.
 * **No CascLib at all?** Open the game in [CascView](http://www.zezula.net/en/casc/main.html),
   extract the `mods` and `campaigns` folders somewhere, and run with `--from-extracted <that folder>`
   instead of `--game`.
