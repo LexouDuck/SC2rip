@@ -1,0 +1,2 @@
+M3Studio by Solstice245 - https://github.com/Solstice245/m3studio
+Bundled commit: bef1b08136d73d6b530d07068dbb510aeba4c6db (2026-09-28), unmodified. GPL-2.0-or-later (see LICENSE).
