@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
-CONVERTER_VERSION = '4'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '5'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -120,7 +120,9 @@ def scan(storage, categories):
         lc = p.lower()
         if lc.endswith(('.m3', '.m3a')):
             m = ASSET_RE.match(lc)
-            if m and m.group('cat') in categories:
+            # localized packages (zhcn.sc2assets, ...) hold regional variants of base models with the
+            # same file names, and usually aren't downloaded - only use the base package
+            if m and m.group('cat') in categories and m.group('pkg') in (None, 'base.sc2assets'):
                 models.append(ModelFile(p, m))
         elif lc.endswith(('.dds', '.tga', '.png', '.jpg')):
             i = lc.find('assets/')
@@ -151,12 +153,14 @@ def resolve_texture(ref, textures, container, melee_order):
     rank = {c: i for i, c in enumerate(melee_order[::-1])}  # newest melee mod first
 
     def score(p):
-        c = container_of(p.lower())
+        lp = p.lower()
+        localized = int('.sc2assets/' in lp and '/base.sc2assets/' not in lp)   # prefer base packages
+        c = container_of(lp)
         if c == container:
-            return (0, 0)
+            return (localized, 0, 0)
         if c in rank:
-            return (1, rank[c])
-        return (2, 0)
+            return (localized, 1, rank[c])
+        return (localized, 2, 0)
     return sorted(cands, key=score)[0]
 
 
@@ -440,7 +444,7 @@ def main():
                      help='parallel Blender processes')
     run.add_argument('--timeout', type=int, default=1800, help='seconds per folder')
     run.add_argument('--list-only', action='store_true',
-                     help='only scan and write <out>/_plan.csv + container summary (no extraction)')
+                     help='only scan and write <out>/_plan.tsv + container summary (no extraction)')
     run.add_argument('--force', action='store_true', help='redo folders that already finished')
     args = ap.parse_args()
 
@@ -476,8 +480,8 @@ def main():
     for m in models:
         k = (m.container, m.group, m.label)
         summary.setdefault(k, {'units': 0, 'buildings': 0})[m.cat] += 1
-    with open(os.path.join(args.out, '_containers.csv'), 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
+    with open(os.path.join(args.out, '_containers.tsv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f, delimiter='\t', lineterminator='\n')
         w.writerow(['container', 'group', 'label', 'unit_files', 'building_files'])
         for (c, g, l), v in sorted(summary.items(), key=lambda kv: (GROUP_ORDER.index(kv[0][1]), kv[0][0])):
             w.writerow([c, g, l, v['units'], v['buildings']])
@@ -502,14 +506,14 @@ def main():
         rx = re.compile(args.filter, re.I)
         folders = {k: v for k, v in folders.items() if rx.search(k.replace('\\', '/'))}
 
-    with open(os.path.join(args.out, '_plan.csv'), 'w', newline='', encoding='utf-8') as f:
-        w = csv.writer(f)
+    with open(os.path.join(args.out, '_plan.tsv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f, delimiter='\t', lineterminator='\n')
         w.writerow(['output_folder', 'storage_path', 'group', 'container'])
         for k, ms in folders.items():
             for m in ms:
                 w.writerow([k, m.path, m.group, m.container])
     n_m3 = sum(1 for ms in folders.values() for m in ms if m.ext == 'm3')
-    log(f'Plan: {len(folders)} output folders, {n_m3} .m3 models (see _plan.csv)')
+    log(f'Plan: {len(folders)} output folders, {n_m3} .m3 models (see _plan.tsv)')
     if args.list_only:
         return
 
@@ -751,16 +755,16 @@ def main():
     # ---- 5. report
     fields = ['folder', 'model', 'status', 'dae', 'animations', 'meshes', 'bones',
               'missing_textures', 'warnings', 'error']
-    with open(os.path.join(args.out, '_report.csv'), 'w', newline='', encoding='utf-8') as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+    with open(os.path.join(args.out, '_report.tsv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fields, delimiter='\t', lineterminator='\n')
         w.writeheader()
         for r in report_rows:
-            w.writerow({k: r.get(k, '') for k in fields})
+            w.writerow({k: str(r.get(k, '')).replace('\t', ' ').replace('\n', ' ') for k in fields})
     counts = {}
     for r in report_rows:
         counts[r['status']] = counts.get(r['status'], 0) + 1
     log('Finished: ' + ', '.join(f'{k}={v}' for k, v in sorted(counts.items())) +
-        f'. Report: {os.path.join(args.out, "_report.csv")}')
+        f'. Report: {os.path.join(args.out, "_report.tsv")}')
 
 
 if __name__ == '__main__':

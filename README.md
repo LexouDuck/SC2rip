@@ -17,9 +17,10 @@ textures as `.png`.
   Buildings/
     Melee/Protoss/Nexus/...
     Campaign - .../
-  _report.csv      one row per model: ok / error / duplicate, animation count, missing textures
-  _plan.csv        what was selected, and from which game container
-  _containers.csv  every mod/campaign that holds unit/building models, and how it was classified
+  (all reports are tab-separated)
+  _report.tsv      one row per model: ok / error / duplicate, animation count, missing textures
+  _plan.tsv        what was selected, and from which game container
+  _containers.tsv  every mod/campaign that holds unit/building models, and how it was classified
   _log.txt
   _work/           scratch files (raw .m3, texture cache, per-folder Blender logs). Safe to delete.
 ```
@@ -85,7 +86,7 @@ BLENDER="$HOME/opt/blender-4.5.x-linux-x64/blender"
 python3 sc2rip.py --game "$GAME" --out ~/sc2rip_out --list-only
 ```
 
-Check `_containers.csv` and `_plan.csv` (see "Things to verify" below). Then try a handful of folders:
+Check `_containers.tsv` and `_plan.tsv` (see "Things to verify" below). Then try a handful of folders:
 
 ```sh
 python3 sc2rip.py --game "$GAME" --out ~/sc2rip_out --blender "$BLENDER" \
@@ -157,10 +158,9 @@ Blender's own output.
 ## OBJ files
 
 Each model also gets a Wavefront `.obj` + `.mtl`. OBJ can't store a skeleton or animation, so it's
-the model in its **bind pose** (the pose the mesh is stored in), Y-up as is usual for OBJ. The
-`.mtl` references the diffuse and emissive PNGs (when they use the first UV set), and the normal
-map too when you use `--normal-maps rgb`. With the default `raw` normal maps it's left out on purpose: no OBJ viewer
-understands the SC2 packing.
+the model in its **bind pose** (the pose the mesh is stored in), Y-up as is usual for OBJ, with
+every part included. Materials are described under "What's in the .dae / .obj". The normal map is
+only referenced with `--normal-maps rgb`, since no OBJ viewer understands SC2's packed normal maps.
 
 ## Viewing in Blender
 
@@ -226,7 +226,6 @@ Besides standard materials, SC2 uses a few effect-only material types, rebuilt l
 * **lens flare / buffer**: invisible.
 
 In the `.dae`/`.obj` these effect materials are written **fully transparent** (alpha 0 / `d 0`).
-Materials without a diffuse texture are black rather than white, as in game.
 
 ### Normal maps
 
@@ -242,27 +241,65 @@ on the material nodes, on the same timeline and with the same markers as the ske
 along with each animation in the `.blend`. **They can't be carried in the `.dae` or `.obj`**: COLLADA
 and OBJ have no standard way to store texture animation, and no common importer would read it.
 
-## What's in the .dae / known limitations
+## What's in the .dae / .obj
 
-* **Materials**: the DAE references the **diffuse** texture. That's all Blender's COLLADA exporter
-  writes. Every other texture the model uses (normal, specular, emissive, ...) is still converted
-  and put in the folder. The `.obj` references a few more (see above), and the `.blend` has them
-  all wired up.
-* **Decals & other layers on a second UV set** (e.g. the Protoss logo emissive), or with a UV
-  transform, are **left out of the DAE/OBJ materials** rather than mapped wrongly. OBJ only has
-  one UV set, and the exporters can't express per-texture UV sets. The DAE still contains all
-  UV sets, and the `.blend` maps every layer correctly.
-* **Team colour**: SC2 diffuse textures usually carry the team-colour mask in their **alpha
-  channel**. It's preserved in the PNG. Some viewers display it as transparency.
+**Materials.** COLLADA and OBJ only understand "a colour texture, optionally with alpha", so each
+material is reduced to that:
+
+* **main texture**: the diffuse texture, or the **emissive** texture for glow/effect materials that
+  have no diffuse (energy fields, beams, glows). Its UV set and UV tiling/offset/rotation are
+  **baked into the exported UVs**, so decals on a second UV set or tiled beams map correctly;
+* **alpha**:
+  * alpha-masked (cut-out) and alpha-blended materials get their alpha mask;
+  * **additive** materials (glows that add light) get alpha = brightness, so their black parts
+    are see-through. OBJ/COLLADA can't do true additive blending, so glows are alpha-blended
+    over what's behind them instead;
+* **colour operations** the layer applies in game (brightness, multiply, add, clamp, the glow's
+  HDR strength) are baked into the texture.
+
+When anything needs baking, an extra PNG is written next to the original:
+`<texture>_Additive.png`, `<texture>_Alpha.png` or `<texture>_Color.png`. The original textures are
+always there unchanged too.
+
+In the files:
+* **DAE:** the texture is written as diffuse, with standard COLLADA `<transparent>` (alpha) and
+  `<emission>` (glow) entries. Blender's COLLADA exporter can't write those, so sc2rip adds them.
+* **OBJ:** `map_Kd`, `map_d` (alpha) and `map_Ke` (glow).
+
+Distortion/volume/flare-only materials are written fully transparent. Normal/specular maps are
+only in the `.blend` (plus the PNGs).
+
+**Mesh visibility.** SC2 shows and hides parts of a model per animation. For example, death models
+show a different debris set in each death variant. In the `.blend` this is animated object
+visibility. COLLADA has no visibility channel, so in the `.dae` a hidden part is collapsed to a
+point by shrinking the bones only it uses. If a hidden part shares bones with a visible one, it
+stays visible rather than distorting the visible part. The OBJ (static) contains every part.
+
+**Validity.** Every `.dae` is valid against the official COLLADA 1.4.1 schema. sc2rip fixes names,
+IDs and empty sections that Blender's exporter gets wrong.
+
+**Other limitations**
 * **Not exported**: particle systems, ribbons, lights, hit-test/physics volumes, attachment points
   (they have no COLLADA equivalent). Models that are *only* effects (no mesh) are skipped and
   listed as `skipped` in the report (`--keep-empty` to export them anyway).
+* **Video textures** (`.ogv`, e.g. the Terran blimp ads) can't be converted. They're listed under
+  missing textures in the report.
+* **Localized asset packages** (e.g. `zhcn.sc2assets`, regional variants of some models) are ignored;
+  only the base models are ripped.
 * **`.m3a` files** (external animation files) are attached to the model in the same folder with
   the longest matching name prefix. Unmatched ones are ignored.
-* **Checking results**: Blender's own COLLADA *importer* misreads these animations (it mangles
-  matrix-animated bones), so don't judge the files by re-importing them into Blender. Use
-  [Noesis](https://richwhitehouse.com/index.php?content=inc_projects.php&showproject=91), the
-  Assimp viewer, or the `--save-blend` files.
+
+## Opening the files in other programs
+
+| | .blend | .obj | .dae |
+|---|---|---|---|
+| Blender 4.5 | everything | mesh, textures, alpha, glow | mesh & textures. **Alpha is ignored and bone animation is misread by Blender's COLLADA importer** |
+| Blender 5.x | everything | mesh, textures, alpha, glow | no built-in COLLADA support (removed in 5.0). Third-party importer extensions vary |
+| Assimp-based tools, Noesis, 3ds Max, ... | – | mesh, textures, alpha | mesh, skeleton, animation, diffuse + emission + opacity textures |
+
+Blender's built-in COLLADA importer was unmaintained for years and removed in Blender 5.0. Its
+shortcomings show up on *any* skinned, matrix-animated COLLADA file, not just these. To check a
+`.dae`, use an Assimp-based viewer or Noesis; to work in Blender, use the `.blend`.
 
 ## Things to verify on the first run
 
@@ -271,9 +308,9 @@ end-to-end on synthetic `.m3` models (rigged, textured, multi-part animations), 
 checked numerically against ground truth. The **CASC side has not been run against the real game**.
 On your first `--list-only` run, please check:
 
-1. `_containers.csv` lists the melee mods (`mods/liberty.sc2mod`, `mods/swarm.sc2mod`,
+1. `_containers.tsv` lists the melee mods (`mods/liberty.sc2mod`, `mods/swarm.sc2mod`,
    `mods/void.sc2mod`, ...) and the campaigns with non-zero unit/building counts. If it's empty or
-   odd, look at a few lines of `_plan.csv` and tell me what the paths look like.
+   odd, look at a few lines of `_plan.tsv` and tell me what the paths look like.
 2. Anything classified as `other` that you consider campaign or standard can be added with `--containers`.
 3. A few shading details are educated guesses, because no public documentation covers them:
    * which way the green channel of normal maps points (*Flip Green*, see above);
@@ -286,8 +323,8 @@ On your first `--list-only` run, please check:
 
    If one of these looks consistently wrong on real models, tell me what you see and I'll adjust it.
 
-If something fails, the useful bits to send back are `_containers.csv`, the first lines of
-`_report.csv`, and the matching log from `_work/jobs/` (each folder's Blender output is logged there).
+If something fails, the useful bits to send back are `_containers.tsv`, the first lines of
+`_report.tsv`, and the matching log from `_work/jobs/` (each folder's Blender output is logged there).
 
 ## Files
 

@@ -16,6 +16,7 @@ Two kinds of material are built:
   channel selection, fresnel, alpha masks and blend modes, and layer animations (scrolling /
   rotating UVs, brightness) keyed on the same timeline as the skeleton.
 """
+import math
 import os
 
 import bpy
@@ -235,56 +236,267 @@ def settings_group():
 # Export material (Principled) - for COLLADA / OBJ
 # --------------------------------------------------------------------------------------
 
-def build_export_material(name, layers, tex_map, report, normal_mode='raw', animated_paths=(), mtype=None,
-                          m3mat=None):
-    mat = bpy.data.materials.get(name)
-    if mat is not None:
-        return mat
+def static_uv(layer):
+    """(uv set name or None for non-UV sources, offset, tiling, z-angle) of a layer at rest."""
+    src = layer.uv_source
+    uvset = UV_SET.get(src)
+    return uvset, (layer.uv_offset[0], layer.uv_offset[1]), (layer.uv_tiling[0], layer.uv_tiling[1]), layer.uv_angle[2]
+
+
+def _offset_equal(a, b, wrap):
+    if wrap:   # with a repeating texture, whole-number offsets change nothing
+        return all(abs((x - y) - round(x - y)) < 1e-4 for x, y in zip(a, b))
+    return all(abs(x - y) < 1e-4 for x, y in zip(a, b))
+
+
+def same_mapping(a, b):
+    sa, sb = static_uv(a), static_uv(b)
+    wrap = a.uv_wrap_x and a.uv_wrap_y and b.uv_wrap_x and b.uv_wrap_y
+    return (sa[0] == sb[0] and _offset_equal(sa[1], sb[1], wrap)
+            and all(abs(x - y) < 1e-4 for x, y in zip(sa[2], sb[2])) and abs(sa[3] - sb[3]) < 1e-4)
+
+
+def mapping_is_identity(layer):
+    uvset, off, tile, ang = static_uv(layer)
+    if uvset is None:
+        return True          # planar / reflection / screen: nothing we could bake anyway
+    return (uvset == 'uv0' and _offset_equal(off, (0, 0), layer.uv_wrap_x and layer.uv_wrap_y)
+            and all(abs(t - 1) < 1e-4 for t in tile) and abs(ang) < 1e-4)
+
+
+def transform_uvs(uvs, layer):
+    """Apply a layer's rest UV transform (M3 texture space, V down) to a flat [u0, v0, u1, v1...] list."""
+    _, (ox, oy), (tx, ty), ang = static_uv(layer)
+    c, s_ = math.cos(ang), math.sin(ang)
+    out = []
+    for i in range(0, len(uvs), 2):
+        x, y = uvs[i] * tx, (1.0 - uvs[i + 1]) * ty
+        x, y = x * c - y * s_ + ox, x * s_ + y * c + oy
+        out += (x, 1.0 - y)
+    return out
+
+
+def export_plan(layers, m3mat, mtype):
+    """Decide how a material is represented in COLLADA/OBJ, which only know "a colour texture
+    with optional alpha". Picks the main texture (diffuse, else the emissive glow), and how its
+    alpha should behave."""
+    plan = {'main': None, 'role': None, 'alpha': None, 'alpha_layer': None, 'glow': False,
+            'transparent': mtype in EXPORT_TRANSPARENT_TYPES, 'const_color': None}
+    if plan['transparent'] or m3mat is None:
+        return plan
+    diff = layers.get('diffuse')
+    if diff is not None and getattr(diff, 'color_type', 'BITMAP') == 'COLOR':
+        plan['const_color'] = tuple(diff.color_value[:3])
+    for role in ('diffuse', 'emissive', 'decal', 'emissive2'):
+        layer = layers.get(role)
+        if layer is not None and layer_bitmap(layer):
+            plan['main'], plan['role'] = layer, role
+            break
+    plan['glow'] = plan['role'] in ('emissive', 'emissive2') or bool(getattr(m3mat, 'unshaded', False))
+    plan['hdr_emis'] = float(getattr(m3mat, 'hdr_emis', 1.0) or 1.0)
+    blend = getattr(m3mat, 'blend_mode', 'OPAQUE')
+    if blend in ('ADD', 'ALPHAA'):
+        plan['alpha'] = 'additive'           # adds light: black = see-through
+    else:
+        al = layers.get('alpha')
+        if al is not None and layer_bitmap(al):
+            plan['alpha'] = 'blend' if blend == 'ALPHAB' else 'mask'
+            plan['alpha_layer'] = al
+    return plan
+
+
+def _pixels(img):
+    import numpy as np
+    w, h = img.size
+    arr = np.empty(w * h * 4, dtype=np.float32)
+    img.pixels.foreach_get(arr)
+    return arr.reshape(h, w, 4)
+
+
+def layer_ops(layer):
+    """The colour operations a layer applies on top of its texture, in the order the .blend
+    material applies them: channel select -> invert -> x brightness x multiply -> + add -> clamp
+    -> x fresnel (only a constant fresnel, min == max, can be baked)."""
+    f = 1.0
+    if layer.fresnel_type != 'DISABLED':
+        f = (layer.fresnel_min + layer.fresnel_max) / 2.0
+    return {'channels': layer.color_channels, 'invert': bool(layer.color_invert),
+            'scale': layer.color_brightness * layer.color_multiply, 'add': layer.color_add,
+            'clamp': bool(layer.color_clamp), 'fresnel': f, 'post': 1.0}
+
+
+def ops_identity(ops):
+    return (ops['channels'] in ('RGB', 'ARGB') and not ops['invert'] and abs(ops['scale'] - 1) < 1e-6
+            and abs(ops['add']) < 1e-6 and abs(ops['fresnel'] - 1) < 1e-6 and abs(ops.get('post', 1) - 1) < 1e-6)
+
+
+def _apply_ops(x, ops):
+    import numpy as np
+    if ops['invert']:
+        x = 1.0 - x
+    x = x * ops['scale'] + ops['add']
+    x = np.maximum(x, 0.0)
+    if ops['clamp']:
+        x = np.minimum(x, 1.0)
+    return np.clip(x * ops['fresnel'] * ops.get('post', 1.0), 0.0, 1.0)
+
+
+def _select(px, channels):
+    """RGB (h, w, 3) for a channel setting: single channels become grey."""
+    import numpy as np
+    idx = {'R': 0, 'G': 1, 'B': 2, 'A': 3}.get(channels)
+    if idx is None:
+        return px[..., :3]
+    return np.repeat(px[..., idx:idx + 1], 3, axis=2)
+
+
+def _scalar(px, channels):
+    idx = {'R': 0, 'G': 1, 'B': 2, 'A': 3}.get(channels)
+    return px[..., idx] if idx is not None else px[..., :3].mean(axis=2)
+
+
+def derive_texture(out_path, main_img, main_ops, alpha_mode, alpha_img=None, alpha_ops=None):
+    """Write the texture COLLADA/OBJ get for a material: the main layer with its colour operations
+    baked in, and an alpha channel encoding its transparency:
+       alpha_mode 'additive': alpha = brightness (max of R, G, B) - black parts of a glow vanish
+       alpha_mode 'mask':     alpha = alpha_img's channel with alpha_ops (resampled to main size)
+       alpha_mode None:       alpha = 1"""
+    import numpy as np
+    px = _pixels(main_img)
+    rgb = _apply_ops(_select(px, main_ops['channels']), main_ops)
+    if alpha_mode == 'additive':
+        a = rgb.max(axis=2)
+    elif alpha_mode == 'mask':
+        src = _pixels(alpha_img)
+        if src.shape[:2] != px.shape[:2]:
+            ys = (np.arange(px.shape[0]) * src.shape[0] // px.shape[0])
+            xs = (np.arange(px.shape[1]) * src.shape[1] // px.shape[1])
+            src = src[ys][:, xs]
+        a = _apply_ops(_scalar(src, alpha_ops['channels']), alpha_ops)
+    else:
+        a = np.ones(rgb.shape[:2], dtype=np.float32)
+    out_px = np.concatenate([rgb, a[..., None]], axis=2).astype(np.float32)
+    h, w = out_px.shape[:2]
+    out = bpy.data.images.new(os.path.splitext(os.path.basename(out_path))[0], w, h, alpha=True)
+    out.alpha_mode = 'STRAIGHT'
+    out.pixels.foreach_set(out_px.ravel())
+    out.filepath_raw = out_path
+    out.file_format = 'PNG'
+    out.save()
+    return out
+
+
+_DERIVED = {}   # (out_dir, signature) -> png path, so identical derived textures are written once
+
+
+def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=None, normal_mode='raw'):
+    """Principled material for Blender's COLLADA/OBJ exporters. Returns (material, info) where info
+    tells postprocess_dae what Blender's exporter can't write ({'alpha': bool, 'glow': bool})."""
+    info = {'alpha': False, 'glow': False, 'emission_node': None}
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
     bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
     bsdf.inputs['Base Color'].default_value = (0.0, 0.0, 0.0, 1.0)   # SC2: no diffuse layer = black
-    if mtype in EXPORT_TRANSPARENT_TYPES:
+    if plan['transparent']:
         bsdf.inputs['Alpha'].default_value = 0.0                    # distortion / volume / flare only
-        return mat
-    diff_layer = layers.get('diffuse')
-    if diff_layer is not None and getattr(diff_layer, 'color_type', 'BITMAP') == 'COLOR':
-        bsdf.inputs['Base Color'].default_value = tuple(diff_layer.color_value[:3]) + (1.0,)
+        return mat, info
+    if plan['const_color'] is not None:
+        bsdf.inputs['Base Color'].default_value = plan['const_color'] + (1.0,)
+    main = plan['main']
+    if main is None:
+        return mat, info
+    png = tex_map.get(norm_tex_key(layer_bitmap(main)))
+    img = load_image(png)
+    if img is None:
+        report['missing_textures'].add(layer_bitmap(main))
+        return mat, info
 
-    def tex_node(role, non_color=False, y=0):
-        layer = layers.get(role)
-        if layer is None or not layer_bitmap(layer):
-            return None
-        png = tex_map.get(norm_tex_key(layer_bitmap(layer)))
-        img = load_image(png, non_color)
-        if img is None:
-            report['missing_textures'].add(layer_bitmap(layer))
-            return None
-        if not layer_uv_is_plain(layer, animated_paths):
-            report.setdefault('not_in_export', []).append(f'{name}:{role}')
-            return None   # COLLADA/OBJ can't express this layer's UVs - keep it out of them
-        node = nt.nodes.new('ShaderNodeTexImage')
-        node.image = img
-        node.label = role
-        node.location = (-600, y)
-        return node
+    stem = os.path.splitext(os.path.basename(png))[0]
+    main_ops = layer_ops(main)
+    if plan['role'] in ('emissive', 'emissive2'):
+        main_ops['post'] = plan.get('hdr_emis', 1.0)   # glow strength, capped at full brightness
+    alpha_mode, alpha_img, alpha_ops = None, None, None
+    if plan['alpha'] == 'additive':
+        alpha_mode = 'additive'
+    elif plan['alpha'] in ('mask', 'blend'):
+        al = plan['alpha_layer']
+        al_png = tex_map.get(norm_tex_key(layer_bitmap(al)))
+        alpha_img = load_image(al_png)
+        if alpha_img is None:
+            report['missing_textures'].add(layer_bitmap(al))
+        elif not same_mapping(al, main):
+            report.setdefault('not_in_export', []).append(f'{name}:alpha (different UV mapping)')
+            alpha_img = None
+        else:
+            alpha_mode, alpha_ops = 'mask', layer_ops(al)
 
-    diff = tex_node('diffuse', y=300) or tex_node('decal', y=300)
-    if diff is not None:
-        nt.links.new(diff.outputs['Color'], bsdf.inputs['Base Color'])
-    emis = tex_node('emissive', y=-600)
-    if emis is not None:
-        nt.links.new(emis.outputs['Color'], bsdf.inputs['Emission Color'])
-        bsdf.inputs['Emission Strength'].default_value = 1.0
-    if normal_mode == 'rgb':   # only a regular normal map is meaningful to other programs
-        norm = tex_node('normal', non_color=True, y=-900)
-        if norm is not None:
+    use_img, has_alpha = img, False
+    # the plain texture works as-is when nothing needs baking
+    plain_alpha = (alpha_mode == 'mask' and alpha_img == img and alpha_ops['channels'] == 'A'
+                   and not alpha_ops['invert'] and abs(alpha_ops['scale'] - 1) < 1e-6
+                   and abs(alpha_ops['add']) < 1e-6 and abs(alpha_ops['fresnel'] - 1) < 1e-6)
+    if ops_identity(main_ops) and (alpha_mode is None or plain_alpha):
+        has_alpha = alpha_mode is not None
+    else:
+        kind = {'additive': 'Additive', 'mask': 'Alpha', None: 'Color'}[alpha_mode]
+        sig = (out_dir, stem, kind, tuple(sorted(main_ops.items())),
+               os.path.basename(al_png) if alpha_img is not None else None,
+               tuple(sorted(alpha_ops.items())) if alpha_ops else None)
+        path = _DERIVED.get(sig)
+        try:
+            if path is None:
+                path = os.path.join(out_dir, f'{stem}_{kind}.png')
+                k = 2
+                while path in _DERIVED.values():
+                    path = os.path.join(out_dir, f'{stem}_{kind}{k}.png')
+                    k += 1
+                derive_texture(path, img, main_ops, alpha_mode, alpha_img, alpha_ops)
+                _DERIVED[sig] = path
+            use_img = load_image(path)
+            has_alpha = alpha_mode is not None
+        except Exception as e:   # never lose the export over a derived texture
+            report.setdefault('warnings', []).append(f'{name}: derived texture failed: {e!r}')
+            use_img, has_alpha = img, False
+
+    tex = nt.nodes.new('ShaderNodeTexImage')
+    tex.image = use_img
+    tex.location = (-600, 300)
+    nt.links.new(tex.outputs['Color'], bsdf.inputs['Base Color'])
+    if has_alpha:
+        nt.links.new(tex.outputs['Alpha'], bsdf.inputs['Alpha'])
+        if hasattr(mat, 'surface_render_method'):
+            mat.surface_render_method = 'BLENDED' if plan['alpha'] != 'mask' else 'DITHERED'
+        info['alpha'] = True
+    info['glow'] = plan['glow']
+    info['emission_node'] = tex          # linked to Emission only for the OBJ export (see blender_convert)
+    if normal_mode == 'rgb' and normal_layer is not None and layer_bitmap(normal_layer) \
+            and same_mapping(normal_layer, main):
+        nimg = load_image(tex_map.get(norm_tex_key(layer_bitmap(normal_layer))), non_color=True)
+        if nimg is not None:
+            ntex = nt.nodes.new('ShaderNodeTexImage')
+            ntex.image = nimg
             nmap = nt.nodes.new('ShaderNodeNormalMap')
-            nmap.location = (-250, -900)
-            nt.links.new(norm.outputs['Color'], nmap.inputs['Color'])
+            nt.links.new(ntex.outputs['Color'], nmap.inputs['Color'])
             nt.links.new(nmap.outputs['Normal'], bsdf.inputs['Normal'])
-    return mat
+    return mat, info
+
+
+def set_export_emission(mat, info, on):
+    """OBJ (map_Ke) can carry an emission texture; Blender's COLLADA exporter would write it as a
+    flat white colour instead, so it's only linked while exporting the OBJ."""
+    nt = mat.node_tree
+    bsdf = next((n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED'), None)
+    if bsdf is None or not info.get('glow') or info.get('emission_node') is None:
+        return
+    sock = bsdf.inputs['Emission Color']
+    for l in list(sock.links):
+        nt.links.remove(l)
+    if on:
+        nt.links.new(info['emission_node'].outputs['Color'], sock)
+        bsdf.inputs['Emission Strength'].default_value = 1.0
+    else:
+        bsdf.inputs['Emission Strength'].default_value = 0.0
 
 
 # --------------------------------------------------------------------------------------
@@ -552,13 +764,16 @@ class SC2MaterialBuilder:
             rgb = inv.outputs[0]
             gray = self.math('SUBTRACT', 1.0, gray)
 
-        # brightness x multiplier (+ add), animatable
+        # brightness x multiplier (+ add), animatable - applied to both the colour and the scalar
         for prop, default in (('color_brightness', 1.0), ('color_multiply', 1.0)):
             val = getattr(layer, prop)
             if abs(val - default) > 1e-6 or self.is_animated(layer, prop):
                 v = self.vmath('SCALE', rgb, scale=val)
                 rgb = v.outputs[0]
                 self.targets.append((f'{lp}.{prop}', 0, v.inputs['Scale'], None))
+                g = self.math('MULTIPLY', gray, val)
+                gray = g
+                self.targets.append((f'{lp}.{prop}', 0, g.node.inputs[1], None))
         if abs(layer.color_add) > 1e-6 or self.is_animated(layer, 'color_add'):
             addn = self.math('ADD', 0.0, layer.color_add)
             self.targets.append((f'{lp}.color_add', 0, addn.node.inputs[1], None))
@@ -566,6 +781,13 @@ class SC2MaterialBuilder:
             for i in range(3):
                 self.link(addn, comb.inputs[i])
             rgb = self.vmath('ADD', rgb, comb.outputs[0]).outputs[0]
+            gray = self.math('ADD', gray, addn)
+        # never negative (negative emission renders black); "clamp" also caps at 1
+        rgb = self.vmath('MAXIMUM', rgb, (0.0, 0.0, 0.0)).outputs[0]
+        gray = self.math('MAXIMUM', gray, 0.0)
+        if layer.color_clamp:
+            rgb = self.vmath('MINIMUM', rgb, (1.0, 1.0, 1.0)).outputs[0]
+            gray = self.math('MINIMUM', gray, 1.0)
 
         # fresnel: strength from view angle
         if layer.fresnel_type != 'DISABLED':

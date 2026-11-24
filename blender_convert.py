@@ -25,6 +25,7 @@ Blender and the joint matrices are sampled and injected here (see inject_animati
 import os
 import sys
 import json
+import re
 import types
 import time
 import traceback
@@ -144,7 +145,10 @@ def collect_sequences(ob):
     Material-layer channels (scrolling UVs, brightness...) are collected separately in
     'mat_channels' - COLLADA can't carry them, but the .blend can. Particle etc. are dropped.
 
-    Returns (defaults, sequences, layer_defaults) where
+    Per-bone render flags ("batching": whether meshes bound to the bone are drawn) are collected as
+    'vis_channels'; vis_defaults holds their default values.
+
+    Returns (defaults, sequences, layer_defaults, vis_defaults) where
         defaults       = {(data_path, index): value}            bone channels
         layer_defaults = {(data_path, index): value}            material-layer channels
         sequences = [{'name', 'length', 'looping', 'source_frames',
@@ -152,11 +156,14 @@ def collect_sequences(ob):
     with frames relative to the start of the sequence.
     """
     defaults, layer_defaults = {}, {}
+    vis_defaults = {pb.name: bool(getattr(pb, 'm3_batching', True)) for pb in ob.pose.bones}
     if ob.m3_animations_default:
         for fc in fcurves_of(ob.m3_animations_default):
             if not len(fc.keyframe_points):
                 continue
-            if is_bone_transform(fc.data_path):
+            if fc.data_path.endswith('.m3_batching') and fc.data_path.startswith('pose.bones['):
+                vis_defaults[fc.data_path.split('"')[1]] = fc.keyframe_points[0].co[1] > 0.5
+            elif is_bone_transform(fc.data_path):
                 defaults[(fc.data_path, fc.array_index)] = fc.keyframe_points[0].co[1]
             elif is_layer_channel(fc.data_path):
                 layer_defaults[(fc.data_path, fc.array_index)] = fc.keyframe_points[0].co[1]
@@ -171,9 +178,15 @@ def collect_sequences(ob):
         f0, f1 = int(g.frame_start), int(g.frame_end)
         if f1 <= f0:
             f1 = f0 + 1
-        channels, mat_channels = {}, {}
+        channels, mat_channels, vis_channels = {}, {}, {}
         for a in sorted([a for a in g.animations if a.action], key=lambda a: a.priority):
             for fc in fcurves_of(a.action):
+                if fc.data_path.endswith('.m3_batching') and fc.data_path.startswith('pose.bones['):
+                    pts = [(kp.co[0] - f0, kp.co[1] > 0.5) for kp in fc.keyframe_points
+                           if f0 - 0.001 <= kp.co[0] <= f1 + 0.001]
+                    if pts:
+                        vis_channels[fc.data_path.split('"')[1]] = pts
+                    continue
                 if is_bone_transform(fc.data_path):
                     target = channels
                 elif is_layer_channel(fc.data_path):
@@ -204,14 +217,15 @@ def collect_sequences(ob):
         play = span - 1
         if not looping:
             if _end_keys_are_wrap(channels, span):
-                for d in (channels, mat_channels):
+                for d in (channels, mat_channels, vis_channels):
                     for key in list(d):
                         d[key] = [p for p in d[key] if p[0] < span - 0.001] or d[key][:1]
             elif any(abs(pts[-1][0] - span) < 0.001 for pts in channels.values()):
                 play = span
         sequences.append({'name': name, 'length': span, 'play_length': max(play, 1), 'looping': looping,
-                          'source_frames': [f0, f1], 'channels': channels, 'mat_channels': mat_channels})
-    return defaults, sequences, layer_defaults
+                          'source_frames': [f0, f1], 'channels': channels, 'mat_channels': mat_channels,
+                          'vis_channels': vis_channels})
+    return defaults, sequences, layer_defaults, vis_defaults
 
 
 def _end_keys_are_wrap(channels, span, tol=1e-3):
@@ -285,6 +299,119 @@ def assign_action(ob, act, frame_start, frame_end):
 
 
 # --------------------------------------------------------------------------------------
+# Mesh visibility ("batching")
+# --------------------------------------------------------------------------------------
+
+class Visibility:
+    """SC2 shows/hides geometry per animation: every mesh batch is bound to a bone, and that bone's
+    (animated) render flag decides whether the batch is drawn. Death models use it to swap debris
+    sets between death variants.
+
+    .blend: the mesh objects get animated hide_viewport / hide_render.
+    COLLADA has no visibility, so there a hidden mesh is collapsed by shrinking the bones that only
+    hidden meshes use (and only when that doesn't disturb any visible mesh)."""
+
+    def __init__(self, ob, meshes, batch_bones, vis_defaults):
+        self.meshes = meshes
+        self.batch_bones = {m.name: [b for b in batch_bones.get(m, []) if b] for m in meshes}
+        self.defaults = vis_defaults
+        self.used_by = {}
+        self.bones_of = {}
+        for m in meshes:
+            names = {g.index: g.name for g in m.vertex_groups}
+            used = set()
+            for v in m.data.vertices:
+                for g in v.groups:
+                    if g.weight > 1e-4 and g.group in names:
+                        used.add(names[g.group])
+            self.bones_of[m.name] = used
+            for b in used:
+                self.used_by.setdefault(b, set()).add(m.name)
+        self.descendants = {b.name: {c.name for c in b.children_recursive} for b in ob.data.bones}
+        self._cache = {}
+
+    def bone_visible(self, seq, bone, rel):
+        pts = seq.get('vis_channels', {}).get(bone)
+        if not pts:
+            return self.defaults.get(bone, True)
+        val = pts[0][1]
+        for f, v in pts:
+            if f <= rel + 1e-6:
+                val = v
+            else:
+                break
+        return val
+
+    def mesh_visible(self, seq, mesh_name, rel):
+        bones = self.batch_bones.get(mesh_name)
+        return True if not bones else any(self.bone_visible(seq, b, rel) for b in bones)
+
+    def is_animated(self, sequences):
+        bound = {b for bs in self.batch_bones.values() for b in bs}
+        return any(not self.defaults.get(b, True) for b in bound) or \
+            any(b in seq.get('vis_channels', {}) for seq in sequences for b in bound)
+
+    def hidden(self, seq, rel):
+        return frozenset(m.name for m in self.meshes if not self.mesh_visible(seq, m.name, rel))
+
+    def collapse_set(self, hidden):
+        """Bones that can be shrunk to hide `hidden` meshes without touching visible ones."""
+        if hidden in self._cache:
+            return self._cache[hidden]
+        h = set(hidden)
+        while True:
+            visible = {m.name for m in self.meshes} - h
+            ok = {b for b, users in self.used_by.items()
+                  if users <= h and not any(self.used_by.get(d, set()) & visible for d in self.descendants.get(b, ()))}
+            h2 = {m for m in h if self.bones_of.get(m) and self.bones_of[m] <= ok}
+            if h2 == h:
+                break
+            h = h2
+        result = frozenset(b for b in ok if self.used_by[b] <= h)
+        self._cache[hidden] = result
+        return result
+
+    def collapse_fn(self, placed):
+        """frame -> set of bones to collapse, for sequences placed at offsets on one timeline."""
+        def fn(frame):
+            seq, off = placed[0]
+            for s_, o in placed:
+                if frame >= o - 1e-6:
+                    seq, off = s_, o
+            return self.collapse_set(self.hidden(seq, min(frame - off, seq['length'])))
+        return fn
+
+    def keyframe_objects(self, placed):
+        """Animated hide_viewport / hide_render on the mesh objects (for the .blend)."""
+        for m in self.meshes:
+            if not self.batch_bones.get(m.name):
+                continue
+            keys = []
+            for seq, off in placed:
+                events = {0.0}
+                for b in self.batch_bones[m.name]:
+                    events.update(f for f, _ in seq.get('vis_channels', {}).get(b, []) if 0 <= f <= seq['length'])
+                for rel in sorted(events):
+                    keys.append((off + rel, 0.0 if self.mesh_visible(seq, m.name, rel) else 1.0))
+            if all(v == 0.0 for _, v in keys):
+                continue
+            act = bpy.data.actions.new(f'{m.name}_Visibility')
+            for prop in ('hide_viewport', 'hide_render'):
+                fc = act.fcurves.new(prop)
+                fc.keyframe_points.add(len(keys))
+                fc.keyframe_points.foreach_set('co', [x for k in keys for x in k])
+                fc.keyframe_points.foreach_set('interpolation', [0] * len(keys))
+                fc.update()
+            m.animation_data_create()
+            m.animation_data.action = act
+            try:
+                if m.animation_data.action_slot is None and len(act.slots):
+                    m.animation_data.action_slot = act.slots[0]
+            except AttributeError:
+                pass
+
+
+# --------------------------------------------------------------------------------------
 # COLLADA export
 # --------------------------------------------------------------------------------------
 
@@ -324,7 +451,7 @@ def export_collada(filepath, opts, has_anims):
 COLLADA_NS = 'http://www.collada.org/2005/11/COLLADASchema'
 
 
-def sample_joint_matrices(ob, frames):
+def sample_joint_matrices(ob, frames, collapse_fn=None):
     """Per-frame joint transforms, as COLLADA wants them: each bone's pose matrix relative to its
     parent bone (root bones: relative to the armature). Same convention as Blender's exporter.
 
@@ -341,8 +468,12 @@ def sample_joint_matrices(ob, frames):
         for f in frames:
             fi = int(f)
             sc.frame_set(fi, subframe=f - fi)
+            collapse = collapse_fn(f) if collapse_fn else ()
             for pb in bones:
                 m = pb.matrix if pb.parent is None else pb.parent.matrix.inverted_safe() @ pb.matrix
+                if pb.name in collapse:   # hidden: shrink the bone (and what hangs off it) to a point
+                    out[pb.name].append((0, 0, 0, m[0][3], 0, 0, 0, m[1][3], 0, 0, 0, m[2][3], 0, 0, 0, 1))
+                    continue
                 out[pb.name].append((m[0][0], m[0][1], m[0][2], m[0][3], m[1][0], m[1][1], m[1][2], m[1][3],
                                      m[2][0], m[2][1], m[2][2], m[2][3], m[3][0], m[3][1], m[3][2], m[3][3]))
     finally:
@@ -355,16 +486,15 @@ def _fmt(values):
     return ' '.join('%.7g' % v for v in values)
 
 
-def inject_animations(dae_path, ob, frame_start, frame_end, fps, step=1):
+def inject_animations(dae_path, ob, frame_start, frame_end, fps, step=1, collapse_fn=None):
     """Write a <library_animations> with one matrix animation per moving joint into a .dae that
     Blender exported without animation (the static pose must be the pose at `frame_start`)."""
     frames = list(range(int(frame_start), int(frame_end) + 1, max(1, int(step))))
     if frames[-1] != int(frame_end):
         frames.append(int(frame_end))
-    mats = sample_joint_matrices(ob, frames)
+    mats = sample_joint_matrices(ob, frames, collapse_fn)
 
-    ET.register_namespace('', COLLADA_NS)
-    tree = ET.parse(dae_path)
+    tree = load_dae(dae_path)
     root = tree.getroot()
     ns = {'c': COLLADA_NS}
     q = lambda tag: f'{{{COLLADA_NS}}}{tag}'
@@ -379,7 +509,7 @@ def inject_animations(dae_path, ob, frame_start, frame_end, fps, step=1):
     n = len(frames)
     written = 0
     for bone, ms in mats.items():
-        nid = joint_ids.get(bone)
+        nid = joint_ids.get(bone) or joint_ids.get(_XML_INVALID.sub('_', bone))
         if nid is None:
             continue
         first = ms[0]
@@ -414,17 +544,42 @@ def inject_animations(dae_path, ob, frame_start, frame_end, fps, step=1):
     return written
 
 
-def postprocess_dae(dae_path, clips=None, fps=30):
-    """Make texture paths relative and add <library_animation_clips> describing each sequence.
+_XML_INVALID = re.compile('[\x00-\x08\x0b\x0c\x0e-\x1f￾￿]')
+_NCNAME_BAD = re.compile(r'[^A-Za-z0-9._-]')
 
-    clips: [{'name', 'frame_start', 'frame_end'}] on the exported timeline (frames at `fps`).
-    """
+
+def load_dae(path):
+    """Parse a .dae, tolerating characters that aren't legal in XML (some SC2 names contain control
+    characters or non-UTF-8 bytes, which Blender writes out verbatim). They are replaced the same
+    way everywhere, so id/sid references stay consistent."""
     ET.register_namespace('', COLLADA_NS)
-    tree = ET.parse(dae_path)
+    with open(path, 'rb') as f:
+        text = f.read().decode('utf-8', errors='replace')
+    text = _XML_INVALID.sub('_', text).replace('�', '_')
+    text = re.sub(r'^<\?xml[^>]*\?>', '', text.lstrip())
+    return ET.ElementTree(ET.fromstring(text))
+
+
+def ncname(value):
+    """COLLADA 1.4.1 requires most 'name' attributes to be XML NCNames (no spaces, parentheses...)."""
+    v = _NCNAME_BAD.sub('_', value) or '_'
+    return v if (v[0].isalpha() or v[0] == '_') else '_' + v
+
+
+def postprocess_dae(dae_path, clips=None, fps=30, material_info=None):
+    """Clean up Blender's .dae so it is valid COLLADA 1.4.1 and complete:
+      * texture paths relative to the .dae
+      * transparency / emission textures Blender's exporter can't write (material_info:
+        {material name: {'alpha': bool, 'glow': bool}})
+      * <library_animation_clips> describing each sequence (clips on the timeline, frames at fps)
+      * NCName-safe 'name' attributes, no empty libraries
+    Returns a list of problems that could not be fixed (e.g. duplicate ids)."""
+    tree = load_dae(dae_path)
     root = tree.getroot()
     ns = {'c': COLLADA_NS}
     q = lambda tag: f'{{{COLLADA_NS}}}{tag}'
     dae_dir = os.path.dirname(os.path.abspath(dae_path))
+    problems = []
 
     for init in root.iterfind('.//c:library_images/c:image/c:init_from', ns):
         if not init.text:
@@ -438,6 +593,52 @@ def postprocess_dae(dae_path, clips=None, fps=30):
                 init.text = rel
                 break
 
+    # --- materials: transparency + emission from the diffuse texture
+    if material_info:
+        effects = {e.get('id'): e for e in root.iterfind('.//c:library_effects/c:effect', ns)}
+        for mat in root.iterfind('.//c:library_materials/c:material', ns):
+            info = material_info.get(mat.get('name'))
+            inst = mat.find('c:instance_effect', ns)
+            if not info or inst is None:
+                continue
+            eff = effects.get(inst.get('url', '#')[1:])
+            if eff is None:
+                continue
+            tech = eff.find('.//c:technique', ns)
+            shading = next((c for c in tech if c.tag in (q('lambert'), q('phong'), q('blinn'), q('constant'))), None) \
+                if tech is not None else None
+            if shading is None:
+                continue
+            diff_tex = shading.find('c:diffuse/c:texture', ns)
+            if diff_tex is None:
+                continue
+            attrs = {'texture': diff_tex.get('texture'), 'texcoord': diff_tex.get('texcoord', 'UVMap')}
+            if info.get('glow'):
+                em = shading.find('c:emission', ns)
+                if em is None:
+                    em = ET.Element(q('emission'))
+                    shading.insert(0, em)
+                for c in list(em):
+                    em.remove(c)
+                ET.SubElement(em, q('texture'), attrs)
+            if info.get('alpha'):
+                for tag in ('transparent', 'transparency'):
+                    old_el = shading.find(f'c:{tag}', ns)
+                    if old_el is not None:
+                        shading.remove(old_el)
+                tr = ET.Element(q('transparent'), {'opaque': 'A_ONE'})
+                ET.SubElement(tr, q('texture'), attrs)
+                trv = ET.Element(q('transparency'))
+                ET.SubElement(trv, q('float'), {'sid': 'transparency'}).text = '1'
+                # schema order: emission ambient diffuse specular shininess reflective reflectivity
+                #               transparent transparency index_of_refraction
+                order = ['emission', 'ambient', 'diffuse', 'specular', 'shininess', 'reflective', 'reflectivity']
+                kids = list(shading)
+                pos = max([i + 1 for i, c in enumerate(kids) if c.tag in [q(t) for t in order]] or [0])
+                shading.insert(pos, tr)
+                shading.insert(pos + 1, trv)
+
+    # --- animation clips
     lib_anims = root.find('c:library_animations', ns)
     if clips and lib_anims is not None:
         top_ids = [a.get('id') for a in lib_anims.findall('c:animation', ns) if a.get('id')]
@@ -447,20 +648,38 @@ def postprocess_dae(dae_path, clips=None, fps=30):
         lib_clips = ET.Element(q('library_animation_clips'))
         used = set()
         for c in clips:
-            cid = ''.join(ch if ch.isalnum() or ch in '_-' else '_' for ch in c['name']) or 'clip'
+            cid = ncname(c['name'])
             base, k = cid, 2
             while cid in used:
                 cid, k = f'{base}_{k}', k + 1
             used.add(cid)
             el = ET.SubElement(lib_clips, q('animation_clip'), {
-                'id': 'clip_' + cid, 'name': c['name'],
+                'id': 'clip_' + cid, 'name': cid,
                 'start': f"{c['frame_start'] / fps:.6f}", 'end': f"{c['frame_end'] / fps:.6f}"})
             for aid in top_ids:
                 ET.SubElement(el, q('instance_animation'), {'url': '#' + aid})
         kids = list(root)
         root.insert(kids.index(lib_anims) + 1, lib_clips)
+
+    # --- schema hygiene
+    for el in root.iter():
+        if 'name' in el.attrib:
+            el.set('name', ncname(el.get('name')))
+    for lib in list(root):
+        if lib.tag.startswith(q('library_')) and len(lib) == 0:
+            root.remove(lib)
+    ids = {}
+    for el in root.iter():
+        i = el.get('id')
+        if i:
+            ids[i] = ids.get(i, 0) + 1
+    dups = sorted(i for i, n in ids.items() if n > 1)
+    if dups:
+        problems.append('duplicate ids in .dae: ' + ', '.join(dups[:5]))
+
     ET.indent(tree, space='  ')
     tree.write(dae_path, xml_declaration=True, encoding='utf-8')
+    return problems
 
 
 def safe_name(s):
@@ -476,6 +695,31 @@ def write_anim_list(path, model_name, clips, fps):
                      f"{'yes' if c['looping'] else 'no'}\t{c['source_frames'][0]}-{c['source_frames'][1]}")
     with open(path, 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines) + '\n')
+
+
+def bake_export_uvs(mob, layer):
+    """Overwrite the first UV set with the layer's UVs (its own UV set + rest transform).
+    Returns the original coordinates for restore_uvs()."""
+    me = mob.data
+    if not me.uv_layers:
+        return None
+    uv0 = me.uv_layers[0]
+    n = len(uv0.data)
+    orig = [0.0] * (2 * n)
+    uv0.data.foreach_get('uv', orig)
+    src_layer = me.uv_layers.get(sm.static_uv(layer)[0] or 'uv0') or uv0
+    src = [0.0] * (2 * n)
+    src_layer.data.foreach_get('uv', src)
+    uv0.data.foreach_set('uv', sm.transform_uvs(src, layer))
+    me.update()
+    return orig
+
+
+def restore_uvs(backup):
+    for mob, orig in backup.items():
+        mob.data.uv_layers[0].data.foreach_set('uv', orig)
+        mob.data.update()
+    backup.clear()
 
 
 def build_blend_materials(mesh_materials, tex_map, equirect, report, normal_mode, animated_paths,
@@ -648,7 +892,7 @@ def convert_model(m3s, model, tex_map, opts):
         if o is not ob and o not in region_set:
             bpy.data.objects.remove(o, do_unlink=True)
 
-    defaults, sequences, layer_defaults = collect_sequences(ob) if get_anims else ({}, [], {})
+    defaults, sequences, layer_defaults, vis_defaults = collect_sequences(ob) if get_anims else ({}, [], {}, {})
     animated_paths = {k[0] for seq in sequences for k in seq['mat_channels']}
     normal_mode = opts.get('normal_maps', 'raw')
 
@@ -659,8 +903,27 @@ def convert_model(m3s, model, tex_map, opts):
     # materials + mesh clean-up
     mat_cache = {}
     mesh_materials = []   # (mesh, material name, m3 material, layers) for the .blend materials
+    export_info = {}      # material name -> what postprocess_dae must add (alpha / glow textures)
+    batch_bones = {}      # mesh -> bones whose render flag controls its visibility
+    uv_backup = {}        # mesh -> original first-UV-set coordinates
+    out_dir = os.path.dirname(os.path.abspath(model['dae']))
+    os.makedirs(out_dir, exist_ok=True)
+    # Blender's COLLADA exporter names joint nodes "<armature>_<bone>"; mesh object names must not
+    # collide with those (some SC2 rigs have bones called "Mesh01"...), or the .dae gets duplicate IDs
+    reserved = {f'{model_stem}_{b.name}'.lower() for b in ob.data.bones}
+    used_names = set()
     for i, mob in enumerate(region_meshes):
-        mob.name = f'{model_stem}_Mesh{i:02d}'
+        for base in ('Mesh', 'Geometry', 'Geo', 'Surface'):
+            cand = f'{model_stem}_{base}{i:02d}'
+            if cand.lower() not in reserved and cand.lower() not in used_names:
+                break
+        else:
+            k = 0
+            while f'{model_stem}_Mesh{i:02d}_{k}'.lower() in reserved | used_names:
+                k += 1
+            cand = f'{model_stem}_Mesh{i:02d}_{k}'
+        used_names.add(cand.lower())
+        mob.name = cand
         mob.data.name = mob.name
         # apply the hard-edge EdgeSplit modifier so sharp edges survive export
         for mod in list(mob.modifiers):
@@ -681,21 +944,37 @@ def convert_model(m3s, model, tex_map, opts):
             matref = shared.m3_pointer_get(ob.m3_materialrefs, batch.material)
             if matref is not None:
                 break
+        bound = []
+        for batch in mob.m3_mesh_batches:
+            pb = shared.m3_pointer_get(ob.pose.bones, batch.bone.handle) if batch.bone.handle else None
+            bound.append(pb.name if pb is not None else None)
+        # a batch without a bone is always drawn
+        batch_bones[mob] = [] if (not bound or None in bound) else bound
         m3mat, mtype = sm.m3_material_from_ref(ob, matref, shared) if matref else (None, None)
         mat_name = matref.name if matref else f'{model_stem}_NoMaterial'
         layers = sm.collect_layers(ob, m3mat, shared)
+        plan = sm.export_plan(layers, m3mat, mtype)
         if mat_name not in mat_cache:
-            mat_cache[mat_name] = sm.build_export_material(mat_name, layers, tex_map, report,
-                                                           normal_mode, animated_paths, mtype, m3mat)
+            mat_cache[mat_name], export_info[mat_name] = sm.build_export_material(
+                mat_name, plan, tex_map, report, out_dir, layers.get('normal'), normal_mode)
         mob.data.materials.clear()
         mob.data.materials.append(mat_cache[mat_name])
         mesh_materials.append((mob, mat_name, m3mat, layers, mtype))
+        # COLLADA/OBJ textures always read the first UV set with no transform: bake the main
+        # texture's UV set / tiling / offset / rotation into it for the export (restored afterwards)
+        if plan['main'] is not None and not sm.mapping_is_identity(plan['main']):
+            backup = bake_export_uvs(mob, plan['main'])
+            if backup is not None:
+                uv_backup[mob] = backup
 
     report['meshes'] = len(region_meshes)
     report['bones'] = len(ob.data.bones)
 
     drop_m3studio_actions(ob)
     fps = bpy.context.scene.render.fps
+    vis = Visibility(ob, region_meshes, batch_bones, vis_defaults)
+    vis_on = bool(sequences) and vis.is_animated(sequences)
+    report['visibility_animated'] = vis_on
 
     if not region_meshes:
         report['warnings'].append('model has no mesh geometry (effect/dummy model)')
@@ -732,8 +1011,9 @@ def convert_model(m3s, model, tex_map, opts):
         timeline_act = act
         assign_action(ob, act, 0, clips[-1]['frame_end'])
         export_collada(model['dae'], opts, False)
-        inject_animations(model['dae'], ob, 0, clips[-1]['frame_end'], fps, opts.get('sampling_rate', 1))
-        postprocess_dae(model['dae'], clips, fps)
+        inject_animations(model['dae'], ob, 0, clips[-1]['frame_end'], fps, opts.get('sampling_rate', 1),
+                          vis.collapse_fn(placed) if vis_on else None)
+        report['warnings'] += postprocess_dae(model['dae'], clips, fps, export_info)
         write_anim_list(os.path.splitext(model['dae'])[0] + '_animations.txt', model_stem, clips, fps)
     else:
         # static export in the default pose
@@ -742,7 +1022,7 @@ def convert_model(m3s, model, tex_map, opts):
                                [(dict(sequences[0], channels={}, length=1, play_length=1), 0)])
             assign_action(ob, act, 0, 1)
         export_collada(model['dae'], opts, False)
-        postprocess_dae(model['dae'])
+        report['warnings'] += postprocess_dae(model['dae'], None, fps, export_info)
 
     # 2) optional: one file per sequence
     if sequences and anim_mode in ('separate', 'both'):
@@ -753,8 +1033,10 @@ def convert_model(m3s, model, tex_map, opts):
             assign_action(ob, act, 0, seq['play_length'])
             path = os.path.join(anim_dir, f"{model_stem}_{safe_name(seq['name'])}.dae")
             export_collada(path, opts, False)
-            inject_animations(path, ob, 0, seq['play_length'], fps, opts.get('sampling_rate', 1))
-            postprocess_dae(path, [{'name': seq['name'], 'frame_start': 0, 'frame_end': seq['play_length']}], fps)
+            inject_animations(path, ob, 0, seq['play_length'], fps, opts.get('sampling_rate', 1),
+                              vis.collapse_fn([(seq, 0)]) if vis_on else None)
+            postprocess_dae(path, [{'name': seq['name'], 'frame_start': 0, 'frame_end': seq['play_length']}], fps,
+                            export_info)
             bpy.data.actions.remove(act)
         if not clips:
             clips = [{'name': s_['name'], 'frame_start': 0, 'frame_end': s_['play_length'],
@@ -764,11 +1046,16 @@ def convert_model(m3s, model, tex_map, opts):
 
     # 3) Wavefront OBJ + MTL (static mesh in its bind pose; OBJ has no skeleton/animation)
     if opts.get('obj', True):
+        for name, info in export_info.items():
+            sm.set_export_emission(mat_cache[name], info, True)
         export_obj(os.path.splitext(model['dae'])[0] + '.obj', region_meshes)
+    restore_uvs(uv_backup)
 
     if opts.get('save_blend'):
         build_blend_materials(mesh_materials, tex_map, set(opts.get('equirect', [])), report, normal_mode,
                               animated_paths, layer_defaults, placed if timeline_act else [])
+        if vis_on and timeline_act is not None:
+            vis.keyframe_objects(placed)
         setup_viewer(ob, region_meshes, clips if timeline_act else [], timeline_act)
         blend_path = os.path.abspath(os.path.splitext(model['dae'])[0] + '.blend')
         # store texture paths relative to the .blend ("//Foo.png") so the folder can be moved/shared
