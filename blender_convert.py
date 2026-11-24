@@ -911,18 +911,11 @@ def convert_model(m3s, model, tex_map, opts):
     # Blender's COLLADA exporter names joint nodes "<armature>_<bone>"; mesh object names must not
     # collide with those (some SC2 rigs have bones called "Mesh01"...), or the .dae gets duplicate IDs
     reserved = {f'{model_stem}_{b.name}'.lower() for b in ob.data.bones}
-    used_names = set()
+    n = len(region_meshes)
+    base = next((b for b in ('Mesh', 'Geometry', 'Geo', 'Surface', 'Part')
+                 if not any(f'{model_stem}_{b}{i:02d}'.lower() in reserved for i in range(n))), 'Mesh_')
     for i, mob in enumerate(region_meshes):
-        for base in ('Mesh', 'Geometry', 'Geo', 'Surface'):
-            cand = f'{model_stem}_{base}{i:02d}'
-            if cand.lower() not in reserved and cand.lower() not in used_names:
-                break
-        else:
-            k = 0
-            while f'{model_stem}_Mesh{i:02d}_{k}'.lower() in reserved | used_names:
-                k += 1
-            cand = f'{model_stem}_Mesh{i:02d}_{k}'
-        used_names.add(cand.lower())
+        cand = f'{model_stem}_{base}{i:02d}'
         mob.name = cand
         mob.data.name = mob.name
         # apply the hard-edge EdgeSplit modifier so sharp edges survive export
