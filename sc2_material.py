@@ -36,12 +36,32 @@ LAYER_ROLES = [
     ('layer_height', 'height'),
     ('layer_light', 'lightmap'),
     ('layer_ao', 'ao'),
+    ('layer_strength', 'strength'),     # displacement / reflection materials
+    ('layer_blur', 'blur'),
+    ('layer_color', 'diffuse'),         # volume materials
 ]
+DISTORTION_TYPES = {'m3_materials_displacement', 'm3_materials_reflection'}
+VOLUME_TYPES = {'m3_materials_volume', 'm3_materials_volumenoise'}
+INVISIBLE_TYPES = {'m3_materials_lensflare', 'm3_materials_buffer'}
+# effect-only materials: no visible surface of their own in game -> fully transparent in DAE/OBJ
+EXPORT_TRANSPARENT_TYPES = DISTORTION_TYPES | VOLUME_TYPES | INVISIBLE_TYPES
+ANIMATED_MATERIAL_PROPS = ('strength_factor', 'density')
 UV_SET = {'UV0': 'uv0', 'UV1': 'uv1', 'UV2': 'uv2', 'UV3': 'uv3', 'PARTICLE': 'uv0'}
 ENV_SOURCES = {'REFCUBE', 'REFSPHERE', 'CUBE', 'SPHERE'}
 ANIMATED_LAYER_PROPS = ('uv_offset', 'uv_angle', 'uv_tiling', 'color_brightness', 'color_multiply',
                         'color_add', 'color_value')
-TEAM_COLOR_LINEAR = (0.47, 0.006, 0.012, 1.0)   # SC2 player-1 red
+TEAM_COLOR_LINEAR = (0.47, 0.006, 0.012)   # red, SC2's player-1 colour
+
+# Settings shown under Scene Properties > Custom Properties; every material reads them.
+SCENE_SETTINGS = [
+    ('team_color', TEAM_COLOR_LINEAR,
+     dict(subtype='COLOR', min=0.0, max=1.0, description='Team colour used by every material')),
+    ('specular_strength', 1.0, dict(min=0.0, soft_max=4.0, description='Multiplier on specular highlights')),
+    ('reflection_strength', 1.0, dict(min=0.0, soft_max=4.0, description='Multiplier on environment reflections')),
+    ('emission_strength', 1.0, dict(min=0.0, soft_max=4.0, description='Multiplier on emissive glow')),
+    ('distortion_visibility', 0.15, dict(min=0.0, soft_max=2.0,
+                                          description='How visible distortion effects (warp shimmer, heat haze) are')),
+]
 
 
 def norm_tex_key(path):
@@ -184,15 +204,14 @@ def sc2_normal_decode_group():
     return ng
 
 
-SETTINGS_OUTPUTS = (('Team Color', 'NodeSocketColor', TEAM_COLOR_LINEAR),
-                    ('Specular Strength', 'NodeSocketFloat', 1.0),
-                    ('Reflection Strength', 'NodeSocketFloat', 1.0),
-                    ('Emission Strength', 'NodeSocketFloat', 1.0))
+SETTINGS_OUTPUTS = (('Team Color', 'team_color'), ('Specular Strength', 'specular_strength'),
+                    ('Reflection Strength', 'reflection_strength'), ('Emission Strength', 'emission_strength'),
+                    ('Distortion Visibility', 'distortion_visibility'))
 
 
 def settings_group():
-    """One node group shared by every material: team colour and global strength multipliers.
-    Edit the values inside it once and the whole model follows (1.0 = the model's own values)."""
+    """Node group shared by every material. It reads the scene's custom properties (team_color,
+    specular_strength, ...) through Attribute nodes, so they can be changed in the Scene tab."""
     name = 'SC2 Settings'
     ng = bpy.data.node_groups.get(name)
     if ng is not None:
@@ -200,16 +219,15 @@ def settings_group():
     ng = bpy.data.node_groups.new(name, 'ShaderNodeTree')
     out = ng.nodes.new('NodeGroupOutput')
     out.location = (300, 0)
-    for i, (label, kind, default) in enumerate(SETTINGS_OUTPUTS):
+    for i, (label, prop) in enumerate(SETTINGS_OUTPUTS):
+        kind = 'NodeSocketColor' if prop == 'team_color' else 'NodeSocketFloat'
         ng.interface.new_socket(label, in_out='OUTPUT', socket_type=kind)
-        if kind == 'NodeSocketColor':
-            n = ng.nodes.new('ShaderNodeRGB')
-        else:
-            n = ng.nodes.new('ShaderNodeValue')
-        n.label = label + ' (edit me)'
-        n.outputs[0].default_value = default
-        n.location = (0, -i * 200)
-        ng.links.new(n.outputs[0], out.inputs[label])
+        n = ng.nodes.new('ShaderNodeAttribute')
+        n.attribute_type = 'VIEW_LAYER'          # looks up the view layer, then the scene
+        n.attribute_name = prop
+        n.label = f'Scene property "{prop}"'
+        n.location = (0, -i * 220)
+        ng.links.new(n.outputs['Color' if prop == 'team_color' else 'Fac'], out.inputs[label])
     return ng
 
 
@@ -217,7 +235,8 @@ def settings_group():
 # Export material (Principled) - for COLLADA / OBJ
 # --------------------------------------------------------------------------------------
 
-def build_export_material(name, layers, tex_map, report, normal_mode='raw', animated_paths=()):
+def build_export_material(name, layers, tex_map, report, normal_mode='raw', animated_paths=(), mtype=None,
+                          m3mat=None):
     mat = bpy.data.materials.get(name)
     if mat is not None:
         return mat
@@ -225,6 +244,13 @@ def build_export_material(name, layers, tex_map, report, normal_mode='raw', anim
     mat.use_nodes = True
     nt = mat.node_tree
     bsdf = next(n for n in nt.nodes if n.type == 'BSDF_PRINCIPLED')
+    bsdf.inputs['Base Color'].default_value = (0.0, 0.0, 0.0, 1.0)   # SC2: no diffuse layer = black
+    if mtype in EXPORT_TRANSPARENT_TYPES:
+        bsdf.inputs['Alpha'].default_value = 0.0                    # distortion / volume / flare only
+        return mat
+    diff_layer = layers.get('diffuse')
+    if diff_layer is not None and getattr(diff_layer, 'color_type', 'BITMAP') == 'COLOR':
+        bsdf.inputs['Base Color'].default_value = tuple(diff_layer.color_value[:3]) + (1.0,)
 
     def tex_node(role, non_color=False, y=0):
         layer = layers.get(role)
@@ -327,6 +353,94 @@ class SC2MaterialBuilder:
 
     def team_color(self):
         return self.setting('Team Color')
+
+    def material_value(self, prop, default=1.0):
+        """A Value node mirroring an (animatable) M3 material property."""
+        v = self.node('ShaderNodeValue', -500, label=prop)
+        v.outputs[0].default_value = getattr(self.m3mat, prop, default)
+        self.targets.append((f'{self.m3mat.path_from_id()}.{prop}', 0, v.outputs[0], None))
+        return v.outputs[0]
+
+    def normal_socket(self):
+        nrm = self.sample('normal', non_color=True)
+        if nrm is None:
+            return None
+        nmap = self.node('ShaderNodeNormalMap', 0, uv_map=UV_SET.get(nrm['layer'].uv_source, 'uv0'))
+        if self.normal_mode == 'raw':
+            g = self.node('ShaderNodeGroup', -150)
+            g.node_tree = sc2_normal_decode_group()
+            self.link(nrm['rgb'], g.inputs['Color'])
+            self.link(nrm['alpha'], g.inputs['Alpha'])
+            self.link(g.outputs['Normal Color'], nmap.inputs['Color'])
+        else:
+            self.link(nrm['rgb'], nmap.inputs['Color'])
+        return nmap.outputs['Normal']
+
+    def _new_material(self):
+        mat = bpy.data.materials.new(self.name)
+        mat.use_nodes = True
+        self.nt = mat.node_tree
+        for n in list(self.nt.nodes):
+            self.nt.nodes.remove(n)
+        return mat, self.node('ShaderNodeOutputMaterial', 900)
+
+    def build_distortion(self):
+        """Displacement/reflection materials: SC2 renders them as a screen-space refraction shimmer
+        (warp-in fields, heat haze) with no colour of their own. Approximated as a transparent
+        surface with a faint normal-mapped sheen, scaled by the strength mask, the material's
+        (animated) distortion factor and the scene's distortion_visibility."""
+        mat, out = self._new_material()
+        self.y = 0
+        normal = self.normal_socket()
+        strength = self.material_value('strength_factor') if hasattr(self.m3mat, 'strength_factor') \
+            else self.material_value('reflection_strength')
+        st = self.sample('strength')
+        if st is not None:
+            strength = self.math('MULTIPLY', strength, st['gray'])
+        strength = self.math('MULTIPLY', strength, self.setting('Distortion Visibility'))
+        comb = self.node('ShaderNodeCombineColor', 100)
+        for i in range(3):
+            self.link(strength, comb.inputs[i])
+        gl = self.node('ShaderNodeBsdfGlossy', 300, distribution='GGX')
+        gl.inputs['Roughness'].default_value = 0.15
+        self.link(comb.outputs[0], gl.inputs['Color'])
+        if normal is not None:
+            self.link(normal, gl.inputs['Normal'])
+        tr = self.node('ShaderNodeBsdfTransparent', 300)
+        add = self.node('ShaderNodeAddShader', 600)
+        self.link(tr.outputs[0], add.inputs[0])
+        self.link(gl.outputs[0], add.inputs[1])
+        self.link(add.outputs[0], out.inputs['Surface'])
+        self._blended(mat)
+        mat.use_backface_culling = False
+        return mat
+
+    def build_volume(self):
+        """Volume (fog) materials: a soft additive glow of the colour layer, scaled by density."""
+        mat, out = self._new_material()
+        self.y = 0
+        col = self.sample('diffuse')
+        rgb = col['rgb'] if col is not None else self.node('ShaderNodeRGB', -300).outputs[0]
+        dens = self.math('MULTIPLY', self.material_value('density', 1.0), 0.2, clamp=True)
+        rgb = self.vmath('SCALE', rgb, scale=dens).outputs[0]
+        rgb = self.vmath('SCALE', rgb, scale=self.setting('Emission Strength')).outputs[0]
+        em = self.node('ShaderNodeEmission', 300)
+        self.link(rgb, em.inputs['Color'])
+        tr = self.node('ShaderNodeBsdfTransparent', 300)
+        add = self.node('ShaderNodeAddShader', 600)
+        self.link(tr.outputs[0], add.inputs[0])
+        self.link(em.outputs[0], add.inputs[1])
+        self.link(add.outputs[0], out.inputs['Surface'])
+        self._blended(mat)
+        mat.use_backface_culling = False
+        return mat
+
+    def build_invisible(self):
+        mat, out = self._new_material()
+        tr = self.node('ShaderNodeBsdfTransparent', 300)
+        self.link(tr.outputs[0], out.inputs['Surface'])
+        self._blended(mat)
+        return mat
 
     # ---- layer sampling
     def uv_vector(self, layer):
@@ -669,7 +783,7 @@ class SC2MaterialBuilder:
             shader = mixn.outputs[0]
         self.link(shader, out.inputs['Surface'])
         mat.use_backface_culling = not getattr(m, 'two_sided', False)
-        mat['sc2rip_m3_blend_mode'] = blend
+        mat['m3_blend_mode'] = blend
         return mat
 
     @staticmethod
@@ -680,9 +794,17 @@ class SC2MaterialBuilder:
             mat.blend_method = 'BLEND'
 
 
-def build_sc2_material(name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths):
+def build_sc2_material(name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths, mtype=None):
     b = SC2MaterialBuilder(name, m3mat, layers, tex_map, equirect, report, normal_mode, animated_paths)
-    mat = b.build()
+    if mtype in DISTORTION_TYPES:
+        mat = b.build_distortion()
+    elif mtype in VOLUME_TYPES:
+        mat = b.build_volume()
+    elif mtype in INVISIBLE_TYPES:
+        mat = b.build_invisible()
+    else:                      # standard, terrain, creep, splat-terrain-bake ...
+        mat = b.build()
+    mat['m3_material_type'] = (mtype or '').replace('m3_materials_', '')
     return mat, b.targets
 
 

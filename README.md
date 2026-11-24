@@ -20,7 +20,7 @@ textures as `.png`.
   _report.csv      one row per model: ok / error / duplicate, animation count, missing textures
   _plan.csv        what was selected, and from which game container
   _containers.csv  every mod/campaign that holds unit/building models, and how it was classified
-  _sc2rip.log
+  _log.txt
   _work/           scratch files (raw .m3, texture cache, per-folder Blender logs). Safe to delete.
 ```
 
@@ -137,6 +137,18 @@ each animation's parts into one complete clip, with every bone keyed.
   animation, each starting at frame 0. This is easiest to use in tools that ignore animation clips.
 * **`both`** = timeline + separate.
 
+**Clip ranges and looping.** In SC2's data the end of a sequence is exclusive: the key sitting
+exactly on the end frame is normally a copy of the first pose, there so looping animations wrap
+smoothly, and the game never shows it. sc2rip handles this as follows:
+
+* **looping** animations (Stand, Walk, ...) stop one frame before that wrap key, so they loop
+  seamlessly;
+* **non-looping** animations (Death, Birth, Attack, ...) whose end key just repeats the opening pose
+  have it removed and **hold their final pose**, so death animations stay dead instead of
+  blending back to standing. If the end key is a genuine final pose, it's kept.
+
+The looping flag of each clip is in `<Model>_animations.txt`.
+
 Bone animation is written as sampled 4×4 matrices, as Blender itself does. Blender 4.5's built-in
 COLLADA animation export is broken for multiple actions, and very slow on big rigs (minutes per
 model), so sc2rip samples the poses itself and writes the same format. It was verified to match
@@ -160,7 +172,7 @@ With `--save-blend`, each `.blend` is set up to open ready to look at:
 * the animation timeline is loaded with a **named marker at the start of every animation**
   (space to play; Shift+arrow keys or the marker menu to jump between them), including
   **texture animations** (see below);
-* a sun lamp and a neutral grey world are included for **Rendered** mode (Z → Rendered).
+* a sun lamp (named "Light") and a neutral grey world are included for **Rendered** mode (Z → Rendered).
 
 ### SC2-style materials
 
@@ -178,19 +190,47 @@ glow added on top. sc2rip rebuilds that from the M3 material's own parameters:
 | alpha masks, blend mode (opaque cut-out / alpha blend / additive), two-sided, unshaded | transparency, backface culling, emission-only |
 | per-layer UV source (UV sets 1–4, planar, tri-planar, screen), UV offset / rotation / tiling, channel selection, invert, brightness, fresnel | UV Map / Mapping / math nodes in front of each texture |
 
-**What I'd tweak first, if a model looks off**: every material uses one shared node group called
-**SC2 Settings** (open any material in the Shader Editor and Tab into it). It holds:
+### Team colour and other settings
 
-* **Team Color**: default red;
-* **Specular / Reflection / Emission Strength**: multipliers on top of the model's own values (1.0).
-  Lower *Reflection Strength* if the environment map looks too strong, or raise *Specular
-  Strength* for more sheen.
+All materials read a few settings from the **scene**. To change them, open the **Scene
+Properties** tab (cone-and-spheres icon in the Properties editor) and expand **Custom Properties**:
 
-Changing a value there changes every material in the file at once. There's no metallic value to
-set: the "sheen" SC2 models have comes from their specular map and reflection map, which are both
-reproduced.
+| property | meaning |
+|---|---|
+| `team_color` | team colour (colour picker). Default is red, SC2's player-1 colour |
+| `specular_strength` | multiplier on specular highlights (1.0 = the model's own values) |
+| `reflection_strength` | multiplier on environment reflections |
+| `emission_strength` | multiplier on emissive glow |
+| `distortion_visibility` | how visible distortion effects are (warp-in fields, heat haze; see below) |
 
-**Normal maps**: the *SC2 Normal Decode (DXT5nm)* group has a **Flip Green** input, set to 1
+Changing a value changes every material in the file at once. Material Preview updates live.
+
+In the shader graph, each material has a node group labelled **SC2 Settings (shared)**. It
+contains one *Attribute* node per setting (type *View Layer*, which falls back to the scene), and
+its *Team Color* output feeds a Mix node with the diffuse texture's alpha as the factor. So the
+colour itself isn't stored in the graph; it comes from the scene property. If you append a
+material into another file, add the same scene properties there, or the values read as 0.
+
+There's no metallic value to set: the "sheen" SC2 models have comes from their specular map and
+reflection map, which are both reproduced.
+
+### Effect materials
+
+Besides standard materials, SC2 uses a few effect-only material types, rebuilt like this:
+
+* **displacement / reflection**: screen-space refraction shimmer (e.g. warp-in fields, heat haze),
+  with only a normal map and a strength mask. Rebuilt as a transparent surface with a faint
+  normal-mapped sheen, scaled by the strength mask, the material's (animated) distortion factor and
+  `distortion_visibility`.
+* **volume**: soft additive glow.
+* **lens flare / buffer**: invisible.
+
+In the `.dae`/`.obj` these effect materials are written **fully transparent** (alpha 0 / `d 0`).
+Materials without a diffuse texture are black rather than white, as in game.
+
+### Normal maps
+
+The *SC2 Normal Decode (DXT5nm)* group has a **Flip Green** input, set to 1
 (DirectX convention, as the older SC2 Blender add-on also assumes). If bumps look like dents, set
 it to 0. With `--normal-maps rgb`, the PNGs are converted to regular OpenGL-convention (Blender)
 normal maps instead.
@@ -239,7 +279,10 @@ On your first `--list-only` run, please check:
    * which way the green channel of normal maps points (*Flip Green*, see above);
    * how cube environment maps are oriented (assumed Direct3D cube faces, with the game's Z-up mapped to D3D's Y-up);
    * where UV rotation pivots (assumed the UV origin);
-   * the specularity → roughness conversion.
+   * the specularity → roughness conversion;
+   * how strong distortion effects should look (`distortion_visibility`);
+   * the non-looping end-key rule (see "Clip ranges and looping"). If a non-looping animation
+     still drifts back at its end, tell me which model and animation, so I can look at its keys.
 
    If one of these looks consistently wrong on real models, tell me what you see and I'll adjust it.
 

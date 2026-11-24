@@ -33,7 +33,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
-CONVERTER_VERSION = '3'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '4'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -452,7 +452,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     work = os.path.abspath(args.work or os.path.join(args.out, '_work'))
     os.makedirs(work, exist_ok=True)
-    log_f = open(os.path.join(args.out, '_sc2rip.log'), 'a', encoding='utf-8')
+    log_f = open(os.path.join(args.out, '_log.txt'), 'a', encoding='utf-8')
 
     def log(msg):
         line = f'[{time.strftime("%H:%M:%S")}] {msg}'

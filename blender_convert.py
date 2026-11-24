@@ -124,7 +124,10 @@ def fcurves_of(action):
 
 
 def is_layer_channel(path):
-    return path.startswith('m3_materiallayers[') and path.rsplit('.', 1)[-1] in sm.ANIMATED_LAYER_PROPS
+    """Animated material properties the .blend materials can reproduce."""
+    if path.startswith('m3_materiallayers['):
+        return path.rsplit('.', 1)[-1] in sm.ANIMATED_LAYER_PROPS
+    return path.startswith('m3_materials_') and path.rsplit('.', 1)[-1] in sm.ANIMATED_MATERIAL_PROPS
 
 
 def is_bone_transform(path):
@@ -191,9 +194,39 @@ def collect_sequences(ob):
         while name in used:
             name, k = f'{base}_{k}', k + 1
         used.add(name)
-        sequences.append({'name': name, 'length': f1 - f0, 'looping': not g.not_looping,
+        span = f1 - f0
+        looping = not g.not_looping
+        # M3 sequence ends are exclusive (M3Studio plays start .. end-1). The key sitting exactly on
+        # the end is usually a loop-wrap copy of the first pose, which the game never shows.
+        #  - looping: keep it (so the last frames blend smoothly into the loop) but stop before it
+        #  - non-looping (deaths...): if the end keys merely repeat the opening pose, drop them and
+        #    hold the final pose; if they hold a real final pose, keep and show that frame
+        play = span - 1
+        if not looping:
+            if _end_keys_are_wrap(channels, span):
+                for d in (channels, mat_channels):
+                    for key in list(d):
+                        d[key] = [p for p in d[key] if p[0] < span - 0.001] or d[key][:1]
+            elif any(abs(pts[-1][0] - span) < 0.001 for pts in channels.values()):
+                play = span
+        sequences.append({'name': name, 'length': span, 'play_length': max(play, 1), 'looping': looping,
                           'source_frames': [f0, f1], 'channels': channels, 'mat_channels': mat_channels})
     return defaults, sequences, layer_defaults
+
+
+def _end_keys_are_wrap(channels, span, tol=1e-3):
+    """True if the keys on the sequence's last frame just repeat its first frame (a loop-wrap key)
+    while the pose right before them is different."""
+    at_end, differs = 0, False
+    for pts in channels.values():
+        if len(pts) < 3 or abs(pts[-1][0] - span) > 0.001:
+            continue
+        at_end += 1
+        if abs(pts[-1][1] - pts[0][1]) > tol:
+            return False            # a real final pose
+        if abs(pts[-2][1] - pts[-1][1]) > tol:
+            differs = True
+    return at_end > 0 and differs
 
 
 def build_action(name, defaults, placed):
@@ -451,12 +484,12 @@ def build_blend_materials(mesh_materials, tex_map, equirect, report, normal_mode
     built, targets_by_mat = {}, {}
     for mob, name, m3mat, layers, mtype in mesh_materials:
         if name not in built:
-            if mtype == 'm3_materials_standard' and m3mat is not None:
+            if m3mat is not None:
                 old = bpy.data.materials.get(name)
                 if old is not None:
                     old.name = name + '_export'
                 mat, targets = sm.build_sc2_material(name, m3mat, layers, tex_map, equirect, report,
-                                                     normal_mode, animated_paths)
+                                                     normal_mode, animated_paths, mtype)
                 targets_by_mat[mat] = targets
                 built[name] = mat
             else:
@@ -493,7 +526,7 @@ def export_obj(path, meshes):
         with open(mtl, 'r', encoding='utf-8') as f:
             lines = f.read().split('\n')
         if lines and lines[0].startswith('# Blender'):
-            lines[0] = f'# Exported by sc2rip with Blender {bpy.app.version_string}'
+            lines[0] = f'# Blender {bpy.app.version_string} MTL File'
         with open(mtl, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
 
@@ -533,10 +566,16 @@ def setup_viewer(ob, meshes, clips, timeline_act):
         lo, hi = Vector((-1, -1, 0)), Vector((1, 1, 2))
     center, radius = (lo + hi) / 2, max((hi - lo).length / 2, 0.1)
 
+    # team colour + global strengths: custom properties on the scene, read by every material
+    # (Scene Properties tab > Custom Properties)
+    for key, default, ui in sm.SCENE_SETTINGS:
+        sc[key] = default
+        sc.id_properties_ui(key).update(**ui)
+
     # lighting for Rendered mode (Material Preview uses its own studio HDRI)
-    sun = bpy.data.lights.new('SC2rip_Sun', 'SUN')
+    sun = bpy.data.lights.new('Light', 'SUN')
     sun.energy = 3.0
-    sun_ob = bpy.data.objects.new('SC2rip_Sun', sun)
+    sun_ob = bpy.data.objects.new('Light', sun)
     sc.collection.objects.link(sun_ob)
     sun_ob.rotation_euler = (0.8, 0.0, 0.6)
     world = sc.world or bpy.data.worlds.new('World')
@@ -647,7 +686,7 @@ def convert_model(m3s, model, tex_map, opts):
         layers = sm.collect_layers(ob, m3mat, shared)
         if mat_name not in mat_cache:
             mat_cache[mat_name] = sm.build_export_material(mat_name, layers, tex_map, report,
-                                                           normal_mode, animated_paths)
+                                                           normal_mode, animated_paths, mtype, m3mat)
         mob.data.materials.clear()
         mob.data.materials.append(mat_cache[mat_name])
         mesh_materials.append((mob, mat_name, m3mat, layers, mtype))
@@ -686,7 +725,7 @@ def convert_model(m3s, model, tex_map, opts):
         placed, off = [], 0
         for seq in sequences:
             placed.append((seq, off))
-            clips.append({'name': seq['name'], 'frame_start': off, 'frame_end': off + seq['length'],
+            clips.append({'name': seq['name'], 'frame_start': off, 'frame_end': off + seq['play_length'],
                           'looping': seq['looping'], 'source_frames': seq['source_frames']})
             off += seq['length'] + gap
         act = build_action(model_stem + '_AllAnimations', defaults, placed)
@@ -699,7 +738,8 @@ def convert_model(m3s, model, tex_map, opts):
     else:
         # static export in the default pose
         if sequences:
-            act = build_action(model_stem + '_Default', defaults, [(dict(sequences[0], channels={}, length=1), 0)])
+            act = build_action(model_stem + '_Default', defaults,
+                               [(dict(sequences[0], channels={}, length=1, play_length=1), 0)])
             assign_action(ob, act, 0, 1)
         export_collada(model['dae'], opts, False)
         postprocess_dae(model['dae'])
@@ -710,14 +750,14 @@ def convert_model(m3s, model, tex_map, opts):
         os.makedirs(anim_dir, exist_ok=True)
         for seq in sequences:
             act = build_action(f"{model_stem}_{seq['name']}", defaults, [(seq, 0)])
-            assign_action(ob, act, 0, seq['length'])
+            assign_action(ob, act, 0, seq['play_length'])
             path = os.path.join(anim_dir, f"{model_stem}_{safe_name(seq['name'])}.dae")
             export_collada(path, opts, False)
-            inject_animations(path, ob, 0, seq['length'], fps, opts.get('sampling_rate', 1))
-            postprocess_dae(path, [{'name': seq['name'], 'frame_start': 0, 'frame_end': seq['length']}], fps)
+            inject_animations(path, ob, 0, seq['play_length'], fps, opts.get('sampling_rate', 1))
+            postprocess_dae(path, [{'name': seq['name'], 'frame_start': 0, 'frame_end': seq['play_length']}], fps)
             bpy.data.actions.remove(act)
         if not clips:
-            clips = [{'name': s_['name'], 'frame_start': 0, 'frame_end': s_['length'],
+            clips = [{'name': s_['name'], 'frame_start': 0, 'frame_end': s_['play_length'],
                       'looping': s_['looping'], 'source_frames': s_['source_frames']} for s_ in sequences]
 
     report['animations'] = clips
@@ -736,6 +776,9 @@ def convert_model(m3s, model, tex_map, opts):
             if img.filepath and not img.filepath.startswith('//'):
                 img.filepath = '//' + os.path.relpath(os.path.abspath(img.filepath),
                                                       os.path.dirname(blend_path)).replace(os.sep, '/')
+        bpy.context.preferences.filepaths.save_version = 0      # no .blend1 backup files
+        if os.path.isfile(blend_path):
+            os.remove(blend_path)
         bpy.ops.wm.save_as_mainfile(filepath=blend_path, check_existing=False, compress=True,
                                     relative_remap=True)
 
@@ -754,7 +797,7 @@ def convert_textures_with_blender(pairs):
             if not w or not h:
                 raise RuntimeError('Blender could not decode the image')
             px = src.pixels[:]                     # raw stored values, no colour transform
-            dst = bpy.data.images.new('sc2rip_tmp', w, h, alpha=True)
+            dst = bpy.data.images.new('converted', w, h, alpha=True)
             dst.pixels[:] = px
             os.makedirs(os.path.dirname(png), exist_ok=True)
             dst.filepath_raw = png
