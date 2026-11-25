@@ -63,6 +63,24 @@ goes with it. `_plan.tsv` lists, for every model, where it's filed (`filed_as`),
 (`stored_in`), which mods/campaigns use it (`used_by`) and how that was found (`found_by`). Reading
 the game data takes a while the first time; the result is cached in `_work/model_refs.json`.
 
+### Death models
+
+Death models are separate models with folders of their own, named after their unit
+(`MarineDeathAcid`, `Marine_Silver_DeathRagdoll`, `BarracksFlyDeath`...). sc2rip files them in a
+subfolder of their unit, without the unit's name:
+
+    Units/Melee/Terran/Marine/                 Marine.dae, .glb ...
+    Units/Melee/Terran/Marine/death/
+    Units/Melee/Terran/Marine/deathacid/
+    Units/Melee/Terran/Marine_Silver/deathragdoll/
+    Buildings/Melee/Terran/Barracks/flydeath/
+
+A death folder goes with its unit (Melee, Campaign...) wherever the unit goes; `found_by` says
+`unit` when that's the only reason. The unit is the longest folder name of the same race that
+starts the death folder's name, possibly followed by a state (`fly`, `lowered`, `sieged`,
+`unpowered`, `hive`...). Death folders of no unit (`ProtossBuildingDeathEx1`, the shared building
+deaths) stay where they are. `--flat-deaths` keeps every death folder at the top level.
+
 `--sources` picks which of these to rip (default `melee,campaign,unused`; add `coop`, `other`).
 `--classify location` goes back to sorting by where the files are stored. sc2rip also does that
 when it finds no model references in the game data.

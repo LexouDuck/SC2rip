@@ -113,7 +113,7 @@ def safe(s):
 
 class ModelFile:
     __slots__ = ('path', 'lc', 'container', 'group', 'label', 'prio', 'cat', 'rel', 'ext',
-                 'out_group', 'out_label', 'refs', 'ref_how')
+                 'out_group', 'out_label', 'refs', 'ref_how', 'nest')
 
     def __init__(self, path, m):
         self.path = path
@@ -126,6 +126,7 @@ class ModelFile:
         # where the model is filed in the output: by default where it is stored, see classify_by_data()
         self.out_group, self.out_label = self.group, self.label
         self.refs, self.ref_how = None, ''
+        self.nest = None    # (parent folder name, subfolder): see nest_death_folders()
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
@@ -377,6 +378,8 @@ def classify_by_data(models, refs, log):
         best = min((m for m in ms if m.ext == 'm3'), default=ms[0], key=lambda m: rank[id(m)])
         for m in ms:
             m.out_group, m.out_label = best.out_group, best.out_label
+            if not m.ref_how and best.ref_how:
+                m.ref_how = 'unit' if m.nest else 'folder'
     counts, hows = {}, {}
     for m in models:
         if m.ext == 'm3':
@@ -389,8 +392,51 @@ def classify_by_data(models, refs, log):
 
 
 def asset_folder_key(m):
+    """The unit a model file belongs to: (category, race, unit folder). Death models nested under
+    a unit (see nest_death_folders) belong to that unit."""
     parts = m.rel.lower().split('/')
+    if m.nest:
+        return (m.cat, parts[0], m.nest[0].lower())
     return (m.cat, parts[0], parts[1] if len(parts) >= 3 else os.path.splitext(parts[-1])[0])
+
+
+# Death models live in folders of their own, named after their unit: MarineDeathAcid,
+# Marine_Silver_DeathRagdoll, BarracksFlyDeath, Hatchery_Mecha_Hive_Death... They are filed in a
+# subfolder of that unit, named without the unit's name: Units/Melee/Terran/Marine/deathacid.
+# The unit is the longest other folder of the same race whose name starts the death folder's name,
+# with at most one of these unit states in between (BarracksFlyDeath -> Barracks/flydeath).
+DEATH_STATES = ('', 'empty', 'fly', 'morph', 'unpowered', 'detached', 'open', 'lowered', 'sieged',
+                'unburrowed', 'burrow', 'burrowed', 'phasing', 'hive', 'lair', 'yamato', 'warpgate',
+                'acid', 'fire', 'walk', 'physics', 'construction')
+
+
+def nest_death_folders(models):
+    """Set m.nest for the models of death folders that belong to another unit folder."""
+    folders = {}            # (cat, race) -> {lowercase folder: original-case folder}
+    for m in models:
+        parts = m.rel.split('/')
+        if len(parts) >= 3:
+            folders.setdefault((m.cat, parts[0].lower()), {}).setdefault(parts[1].lower(), parts[1])
+    nested = {}
+    for (cat, race), names in folders.items():
+        for name in names:
+            i = name.find('death')
+            if i <= 0:
+                continue
+            head = name[:i]
+            cands = [p for p in names if p != name and len(p) >= 3 and 'death' not in p and head.startswith(p)
+                     and head[len(p):].strip('_') in DEATH_STATES]
+            if cands:
+                parent = max(cands, key=len)
+                sub = name[len(parent):].strip('_')
+                nested[(cat, race, name)] = (names[parent], sub)
+    n = 0
+    for m in models:
+        parts = m.rel.split('/')
+        if len(parts) >= 3:
+            m.nest = nested.get((m.cat, parts[0].lower(), parts[1].lower()))
+            n += m.nest is not None and m.ext == 'm3'
+    return len(nested), n
 
 
 # --------------------------------------------------------------------------------------
@@ -491,6 +537,8 @@ def folder_for(m):
     race = pretty(parts[0]) if len(parts) >= 2 else 'Misc'
     stem = os.path.splitext(parts[-1])[0]
     unit = pretty(parts[1], stem) if len(parts) >= 3 else pretty(stem)
+    if m.nest:
+        unit = os.path.join(safe(pretty(m.nest[0], stem[:len(m.nest[0])])), safe(m.nest[1].lower()))
     cat = 'Units' if m.cat == 'units' else 'Buildings'
     group, label = m.out_group, m.out_label
     if group == 'melee':
@@ -503,7 +551,7 @@ def folder_for(m):
         grp = 'Unused'
     else:
         grp = f'Other - {label}'
-    return os.path.join(cat, safe(grp), safe(race), safe(unit))
+    return os.path.join(cat, safe(grp), safe(race), unit if m.nest else safe(unit))
 
 
 # --------------------------------------------------------------------------------------
@@ -760,6 +808,9 @@ def main():
                      help='explicit container list, overrides --sources (e.g. mods/liberty.sc2mod)')
     sel.add_argument('--filter', help='regex; only output folders whose path matches (case-insensitive)')
     sel.add_argument('--exclude', help='regex; skip model files whose storage path matches')
+    sel.add_argument('--flat-deaths', action='store_true',
+                     help="keep death models in folders of their own (default: in a subfolder of their unit, "
+                          "e.g. Units/Melee/Terran/Marine/deathacid)")
     sel.add_argument('--no-dedupe', action='store_true',
                      help='keep campaign/co-op models that are byte-identical to an already-ripped one')
     sel.add_argument('--limit', type=int, default=0, help='only process the first N folders (testing)')
@@ -858,6 +909,9 @@ def main():
             w.writerow([c, g, l, v['units'], v['buildings']])
             log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d}')
 
+    if not args.flat_deaths:
+        n_folders, n_m3 = nest_death_folders(models)
+        log(f'Death models: {n_folders} folders ({n_m3} .m3) go in a subfolder of their unit')
     if args.classify == 'data':
         log('Sorting models by the game data that uses them ...')
         os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)
@@ -880,6 +934,11 @@ def main():
         folders.setdefault(key, []).append(m)
         if key not in display or sum(c.isupper() for c in name) > sum(c.isupper() for c in display[key]):
             display[key] = name
+    # a death subfolder's unit folder is spelled as the unit's own output folder is
+    for k in sorted(display, key=len):
+        head, sep, tail = k.rpartition(os.sep)
+        if sep and head in display:
+            display[k] = display[head] + sep + display[k].rpartition(os.sep)[2]
     folders = {display[k]: v for k, v in folders.items()}
     if args.filter:
         rx = re.compile(args.filter, re.I)
