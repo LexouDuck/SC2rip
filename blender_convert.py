@@ -829,6 +829,7 @@ def export_obj(path, meshes):
 # --------------------------------------------------------------------------------------
 
 ALL_ANIMATIONS = 'All Animations'
+SUN_STRENGTH = 3.0      # W/m2, the .blend's sun lamp (and the .glb's, with --glb-light)
 NODE_PATH_RE = re.compile(r'^nodes\["(.+?)"\]\.inputs\[(\d+)\]\.default_value$')
 
 
@@ -998,7 +999,7 @@ def setup_viewer(ob, meshes, clips, timeline_act):
 
     # lighting for Rendered mode (Material Preview uses its own studio HDRI)
     sun = bpy.data.lights.new('Light', 'SUN')
-    sun.energy = 3.0
+    sun.energy = SUN_STRENGTH
     sun_ob = bpy.data.objects.new('Light', sun)
     sc.collection.objects.link(sun_ob)
     sun_ob.rotation_euler = sm.SUN_EULER
@@ -1091,7 +1092,6 @@ def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, 
     prev_range = (sc.frame_start, sc.frame_end, sc.frame_current)
     tmp_actions = []
     gap = int(opts.get('anim_gap', 1))
-    write_dae = opts.get('dae', True)
     if sequences and not placed:
         off = 0
         for seq in sequences:
@@ -1138,7 +1138,8 @@ def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, 
                               {m[0]: m[1] for m in mesh_materials}, export_info, clips, vis, fps,
                               max(1, int(opts.get('sampling_rate', 1))), opts.get('normal_maps', 'raw'),
                               default_pose, clip_pose, report, team, animated_layers,
-                              opts.get('glb_texture_anims', 'safe'))
+                              opts.get('glb_texture_anims', 'safe'),
+                              (sm.SUN_EULER, SUN_STRENGTH) if opts.get('glb_light') else None)
     finally:
         for (path, idx), v in rest_layers.items():
             try:

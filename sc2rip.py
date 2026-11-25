@@ -920,6 +920,9 @@ def main():
                           '(red, blue, teal, purple, yellow, orange, green, "light pink", violet, "light grey", '
                           '"dark green", brown, "light green", "dark grey", pink), #rrggbb, none (plain '
                           'texture) or all. Default: none')
+    out.add_argument('--glb-light', action='store_true',
+                     help='put a sun lamp in the .glb files (KHR_lights_punctual), as in the .blend: for Blender\'s '
+                          'Rendered view. Other viewers may show it far too bright, or ignore it')
     out.add_argument('--glb-texture-anims', choices=('safe', 'all', 'none'), default='safe',
                      help='texture (UV) animations in the .glb: safe = only those Blender\'s glTF importer '
                           'can read (diffuse textures of lit materials); all = also glows, emission, normal and '
@@ -950,8 +953,6 @@ def main():
     if not args.out:
         ap.error('the following arguments are required: --out')
     try:
-        if args.no_dae and args.no_obj and args.no_glb and args.no_blend and not args.list_only:
-            ap.error('--no-dae, --no-obj, --no-glb and --no-blend: nothing left to write')
         team_colors.parse(args.team_colors)
     except ValueError as e:
         ap.error(f'--team-colors: {e}')
@@ -1081,9 +1082,18 @@ def main():
         import PIL  # noqa: F401
     except ImportError:
         raise SystemExit('Pillow is required for DDS -> PNG conversion: python3 -m pip install pillow')
-    m3studio = ensure_m3studio(args, log)
-    prefix, bl_version = converter_command(args)
-    log(f'Using Blender {bl_version}, M3Studio at {m3studio}')
+    textures_only = args.no_dae and args.no_obj and args.no_glb and args.no_blend
+    try:
+        m3studio = ensure_m3studio(args, log)
+        prefix, bl_version = converter_command(args)
+        log(f'Using Blender {bl_version}, M3Studio at {m3studio}')
+    except SystemExit as e:
+        if not textures_only:
+            raise
+        m3studio, prefix, bl_version = None, None, None     # only needed for a few odd textures
+        log(f'No Blender ({e}): textures Pillow cannot decode will be skipped')
+    if textures_only:
+        log('--no-dae --no-obj --no-glb --no-blend: textures only, no models')
 
     # ---- 3. extract models, dedupe, collect textures
     raw_dir = os.path.join(work, 'raw')
@@ -1251,7 +1261,9 @@ def main():
             log(f'  {fi + 1}/{len(folder_items)} folders prepared')
 
     # Blender-based fallback for textures Pillow couldn't read
-    if tex_fallback:
+    if tex_fallback and prefix is None:
+        log(f'  ! {len(tex_fallback)} textures need Blender to decode: skipped')
+    elif tex_fallback:
         log(f'Converting {len(tex_fallback)} textures with Blender ...')
         fb_job = os.path.join(job_dir, '_textures.json')
         with open(fb_job, 'w', encoding='utf-8') as f:
@@ -1263,7 +1275,7 @@ def main():
     options = {'anim_mode': args.anim_mode, 'sampling_rate': args.anim_sampling,
                'save_blend': not args.no_blend, 'skip_empty': not args.keep_empty, 'animations': True,
                'dae': not args.no_dae, 'obj': not args.no_obj, 'glb': not args.no_glb, 'team_colors': args.team_colors,
-               'glb_texture_anims': args.glb_texture_anims,
+               'glb_texture_anims': args.glb_texture_anims, 'glb_light': args.glb_light,
                'normal_maps': args.normal_maps,
                'converter_version': CONVERTER_VERSION, 'blender_version': bl_version}
 
@@ -1289,6 +1301,8 @@ def main():
                         os.path.getmtime(dst) < os.path.getmtime(png):
                     shutil.copyfile(png, dst)
                 textures_out[key] = dst
+        if textures_only:
+            return job, {'models': [{'textures': True} for _ in job['models']]}, 'textures only'
         jid = hashlib.sha1(job['folder'].encode()).hexdigest()[:12]
         jpath = os.path.join(job_dir, jid + '.json')
         rpath = os.path.join(job_dir, jid + '.result.json')
@@ -1327,7 +1341,10 @@ def main():
         with open(rpath, encoding='utf-8') as f:
             return job, json.load(f), 'done'
 
-    log(f'Converting {len(jobs)} folders with {args.jobs} parallel Blender process(es) ...')
+    if textures_only:
+        log(f'Copying the textures of {len(jobs)} folders ...')
+    else:
+        log(f'Converting {len(jobs)} folders with {args.jobs} parallel Blender process(es) ...')
     done = 0
     with cf.ThreadPoolExecutor(max_workers=args.jobs) as ex:
         futures = [ex.submit(run_job, j) for j in jobs]
@@ -1341,8 +1358,9 @@ def main():
                 continue
             oks = 0
             for m, r in zip(job['models'], res['models']):
-                status = 'skipped' if r.get('skipped') else ('ok' if r.get('ok') else 'error')
-                oks += r.get('ok', False)
+                status = 'textures' if r.get('textures') else \
+                    'skipped' if r.get('skipped') else ('ok' if r.get('ok') else 'error')
+                oks += r.get('ok', False) or r.get('textures', False)
                 err = r.get('error', '') or r.get('skipped', '')
                 report_rows.append(dict(
                     folder=job['folder'], model=m['rel'], status=status,

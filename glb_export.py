@@ -142,13 +142,15 @@ def _continuous(q, ref):
 # --------------------------------------------------------------------------- export
 
 def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, step, normal_mode,
-               default_pose, clip_pose, report, team_colors=(), animated_layers=None, texture_anims='safe'):
+               default_pose, clip_pose, report, team_colors=(), animated_layers=None, texture_anims='safe',
+               light=None):
     """meshes: region mesh objects; mesh_material: {mesh: material name}; export_info: {material
     name: info from sc2_material.build_export_material}; clips: [{'name', 'seq', 'offset',
     'frame_start', 'frame_end'}] on one timeline; default_pose / clip_pose: callables that assign
     the default-pose action / the clips' timeline action; vis: Visibility or None;
     team_colors: [(name, linear rgb or None)], the first is baked into the default materials;
-    animated_layers: {layer path: {animated property names}}."""
+    animated_layers: {layer path: {animated property names}};
+    light: (Blender XYZ euler, strength in W/m2) of a sun lamp to include (KHR_lights_punctual), or None."""
     b = GLTFBuilder(f'sc2rip (Blender {bpy.app.version_string})')
     bones = list(ob.data.bones)
     bone_index = {bn.name: i for i, bn in enumerate(bones)}
@@ -225,6 +227,16 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
             b.doc['nodes'][root]['children'].append(node)
         if hide:
             hideable[node] = (mob, w0)
+    if light is not None:
+        # a directional light shines along its node's -Z in glTF as in Blender: rotate the Blender
+        # sun's orientation into glTF's Y-up space. Blender's importer reads lux / 683 as W/m2.
+        from mathutils import Euler, Quaternion
+        q = Quaternion((Y_UP[3], Y_UP[0], Y_UP[1], Y_UP[2])) @ Euler(light[0], 'XYZ').to_quaternion()
+        b.doc.setdefault('extensions', {})['KHR_lights_punctual'] = {'lights': [
+            {'name': 'Light', 'type': 'directional', 'color': [1.0, 1.0, 1.0], 'intensity': float(light[1]) * 683.0}]}
+        b.extension('KHR_lights_punctual')
+        scene_nodes.append(b.node(name='Light', rotation=[q.x, q.y, q.z, q.w],
+                                  extensions={'KHR_lights_punctual': {'light': 0}}))
     b.doc['scenes'][0]['nodes'] = scene_nodes
 
     # ---- animations

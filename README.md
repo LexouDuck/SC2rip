@@ -202,6 +202,8 @@ regardless.
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
 | `--no-glb` | don't write the `.glb` files |
 | `--no-blend` | don't save the ready-to-view `.blend` per model (see "Viewing in Blender") |
+| | with all four `--no-…` options: **textures only** (the PNGs of every planned folder, no models; Blender isn't needed) |
+| `--glb-light` | put the `.blend`'s sun lamp in the `.glb` files too (see "glTF (.glb) files") |
 | `--team-colors LIST` | `.glb` team colour(s): the first is baked in, the rest become material variants (default `none`: plain textures; see "glTF extensions") |
 | `--glb-texture-anims safe\|all\|none` | which texture animations go in the `.glb` (see "glTF extensions") |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
@@ -278,6 +280,12 @@ validator. It holds:
   (bones, morph weights, materials) at once. Then set the frame range to the animation: in the
   Dope Sheet, select all keys (A) and View → Set Preview Range to Selected (Ctrl+Alt+P). In the
   `.blend`, picking one action switches everything (see "Viewing in Blender").
+  **Lighting:** the `.glb` has no lamp of its own (unless `--glb-light`). In Blender, the lamp you
+  see is the one from Blender's default startup scene (a point light 7 m away, whatever the
+  model's size), which leaves most models dark in Rendered view; Material Preview uses its own
+  studio lighting. `--glb-light` adds the `.blend`'s sun lamp (`KHR_lights_punctual`, written so
+  that Blender imports it at the `.blend`'s strength). Other viewers read glTF light intensities in
+  lux and may show it far too bright, or ignore it, hence off by default.
   Blender's importer also shows the bones as spheres drawn in front of the mesh: that's its
   default bone display; tick "Disable Bone Shape" (Bones section of the import options) for
   regular bones, and turn off Object Properties → Viewport Display → In Front;
