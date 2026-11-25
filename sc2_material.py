@@ -1215,20 +1215,24 @@ def socket_path(socket):
     return socket.path_from_id('default_value')
 
 
-def build_material_actions(targets_by_mat, layer_defaults, placed, build_action):
+def build_material_actions(targets_by_mat, layer_defaults, placed, build_action, all_placed=None, out=None,
+                           name='{mat}_LayerAnims'):
     """Key the node sockets that mirror animated M3 layer properties, on the model's timeline.
 
     targets_by_mat: {material: [(m3_path, m3_index, socket, socket_index)]}
     layer_defaults: {(m3_path, m3_index): value}
     placed:         [(sequence, frame_offset)] - sequences carry 'mat_channels'
     build_action:   blender_convert.build_action(name, defaults, placed)
+    all_placed:     the sequences that decide which sockets are animated (default: placed), so that
+                    actions of single sequences all key the same sockets
+    out:            list that receives (material, action)
     """
     made = 0
     for mat, targets in targets_by_mat.items():
         defaults_t, keymap = {}, {}
         for m3_path, m3_idx, sock, s_idx in targets:
             key_old = (m3_path, m3_idx)
-            if not any(key_old in seq['mat_channels'] for seq, _ in placed):
+            if not any(key_old in seq['mat_channels'] for seq, _ in (all_placed or placed)):
                 continue
             key_new = (socket_path(sock), s_idx if s_idx is not None else 0)
             keymap[key_new] = key_old
@@ -1242,7 +1246,9 @@ def build_material_actions(targets_by_mat, layer_defaults, placed, build_action)
             ch = {kn: seq['mat_channels'][ko] for kn, ko in keymap.items() if ko in seq['mat_channels']}
             placed_t.append((dict(seq, channels=ch), off))
         nt = mat.node_tree
-        act = build_action(f'{mat.name}_LayerAnims', defaults_t, placed_t)
+        act = build_action(name.format(mat=mat.name), defaults_t, placed_t)
+        if out is not None:
+            out.append((mat, act))
         nt.animation_data_create()
         nt.animation_data.action = act
         try:

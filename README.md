@@ -269,7 +269,14 @@ validator. It holds:
 * the **mesh, skeleton and skin weights**, Y-up;
 * **one glTF animation per SC2 animation** ("Stand", "Walk", "Attack 01", "Death 02", ...), named
   as in game, sampled per frame (`--anim-sampling` applies). The node transforms (what you see
-  without playing anything) are the model's default pose;
+  without playing anything) are the model's default pose.
+  **In Blender**, the glTF importer makes each one an action, but only the first is active: the
+  others are parked on muted NLA tracks, and the scene keeps its default 1-250 frame range. To
+  switch, pick an action in the Dope Sheet's Action Editor, or turn on Preferences → Add-ons →
+  glTF 2.0 → "Animation UI" for a "glTF" tab in the Dope Sheet sidebar that switches everything
+  (bones, morph weights, materials) at once. Then set the frame range to the animation: in the
+  Dope Sheet, select all keys (A) and View → Set Preview Range to Selected (Ctrl+Alt+P). The
+  `.blend` (`--save-blend`) does all this for you;
 * **mesh visibility**: parts that SC2 shows or hides per animation (death debris variants, the
   Stargate's work/unpowered effects) get a morph target called `hidden` (weight 1 = hidden),
   switched on and off by each animation. Unlike the `.dae`'s bone trick, this works for any mesh.
@@ -373,9 +380,17 @@ With `--save-blend`, each `.blend` is set up to open ready to look at:
 * the viewport is in **Material Preview** mode (Blender's built-in studio HDRI lighting), framed on
   the model;
 * textures use paths relative to the `.blend`, so the folder can be moved or shared;
-* the animation timeline is loaded with a **named marker at the start of every animation**
-  (space to play; Shift+arrow keys or the marker menu to jump between them), including
-  **texture animations** (see below);
+* **every animation is its own action** ("Stand", "Walk", "Attack 01"...), with its frame range
+  and looping flag set, plus **"All Animations"**: every animation end to end, as on the `.dae`'s
+  timeline, with a named marker at the start of each. Each action animates everything the
+  animation changes: the bones, the **texture animations** (see below) and which meshes are shown.
+  The file opens on "Stand" with the frame range set to it, so space plays it in a loop;
+* an **SC2 Animations panel** (sidebar N → "SC2" tab, in the 3D View, Dope Sheet and NLA editor)
+  lists the animations: click one to switch every part of the model to it and set the frame range
+  to it. The panel is a small script saved in the file (`sc2_animations.py`), so Blender asks before
+  running it ("Allow Execution" in the bar at the top, or Text Editor → Run Script). Without it,
+  pick an action in the Dope Sheet's Action Editor: that switches the skeleton only, and the frame
+  range must then be set by hand;
 * a sun lamp (named "Light") and a neutral grey world are included for **Rendered** mode (Z → Rendered).
 
 ### SC2-style materials

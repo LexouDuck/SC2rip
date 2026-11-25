@@ -381,21 +381,28 @@ class Visibility:
             return self.collapse_set(self.hidden(seq, min(frame - off, seq['length'])))
         return fn
 
-    def keyframe_objects(self, placed):
-        """Animated hide_viewport / hide_render on the mesh objects (for the .blend)."""
+    def _hide_keys(self, m, placed):
+        keys = []
+        for seq, off in placed:
+            events = {0.0}
+            for b in self.batch_bones[m.name]:
+                events.update(f for f, _ in seq.get('vis_channels', {}).get(b, []) if 0 <= f <= seq['length'])
+            for rel in sorted(events):
+                keys.append((off + rel, 0.0 if self.mesh_visible(seq, m.name, rel) else 1.0))
+        return keys
+
+    def keyframe_objects(self, placed, all_placed=None, out=None, name='{mesh}_Visibility'):
+        """Animated hide_viewport / hide_render on the mesh objects (for the .blend). all_placed decides
+        which meshes are animated (default: placed); out receives (mesh object, action)."""
         for m in self.meshes:
             if not self.batch_bones.get(m.name):
                 continue
-            keys = []
-            for seq, off in placed:
-                events = {0.0}
-                for b in self.batch_bones[m.name]:
-                    events.update(f for f, _ in seq.get('vis_channels', {}).get(b, []) if 0 <= f <= seq['length'])
-                for rel in sorted(events):
-                    keys.append((off + rel, 0.0 if self.mesh_visible(seq, m.name, rel) else 1.0))
-            if all(v == 0.0 for _, v in keys):
+            keys = self._hide_keys(m, placed)
+            if all(v == 0.0 for _, v in (keys if all_placed is None else self._hide_keys(m, all_placed))):
                 continue
-            act = bpy.data.actions.new(f'{m.name}_Visibility')
+            act = bpy.data.actions.new(name.format(mesh=m.name))
+            if out is not None:
+                out.append((m, act))
             for prop in ('hide_viewport', 'hide_render'):
                 fc = act.fcurves.new(prop)
                 fc.keyframe_points.add(len(keys))
@@ -787,6 +794,7 @@ def build_blend_materials(mesh_materials, tex_map, equirect, report, normal_mode
     if placed:
         report['animated_materials'] = sm.build_material_actions(targets_by_mat, layer_defaults, placed,
                                                                  build_action)
+    return targets_by_mat
 
 
 def export_obj(path, meshes):
@@ -814,6 +822,195 @@ def export_obj(path, meshes):
             lines[0] = f'# Blender {bpy.app.version_string} MTL File'
         with open(mtl, 'w', encoding='utf-8') as f:
             f.write('\n'.join(lines))
+
+
+# --------------------------------------------------------------------------------------
+# .blend animations: one action per sequence
+# --------------------------------------------------------------------------------------
+
+ALL_ANIMATIONS = 'All Animations'
+
+# Saved in the .blend as a text block that runs when the file opens (Blender asks first, unless
+# Preferences > Save & Load > Auto Run Python Scripts is on). Kept free of SC2rip imports.
+ANIM_SWITCHER = r"""# SC2rip: animation switcher
+#
+# Adds an "SC2 Animations" panel to the sidebar (N) of the 3D View, Dope Sheet and NLA editor, tab "SC2".
+# Clicking an animation switches every animated part of the model to it (skeleton, material layers,
+# visibility of meshes) and sets the scene frame range to it, so playback loops it.
+#
+# Each animation is also a plain action ("Stand", "Walk", ... and "All Animations", every animation
+# end to end as in the .dae): pick one in the Action Editor to see its keys. The action only changes
+# the object it is picked for, though; the panel switches them all.
+#
+# This runs when the file opens if Blender allows it; else run it here: Text > Run Script.
+import bpy
+
+
+def sc2_targets():
+    for ob in bpy.data.objects:
+        yield 'OB' + ob.name, ob
+    for mat in bpy.data.materials:
+        if mat.node_tree is not None:
+            yield 'NT' + mat.name, mat.node_tree
+
+
+def sc2_apply_animation(name, scene=None):
+    act = bpy.data.actions.get(name)
+    if act is None:
+        return False
+    slots = {s.identifier: s for s in act.slots}
+    for ident, idb in sc2_targets():
+        slot = slots.get(ident)
+        ad = idb.animation_data
+        if slot is None:
+            if ad is not None and ad.action is not None and ad.action.get('sc2_animation'):
+                ad.action = None
+            continue
+        if ad is None:
+            ad = idb.animation_data_create()
+        ad.action = act
+        ad.action_slot = slot
+    sc = scene or bpy.context.scene
+    start, end = (int(round(f)) for f in act.frame_range)
+    sc.frame_start, sc.frame_end = start, max(start, end)
+    sc.frame_set(start)
+    sc['sc2_animation'] = name
+    sc.timeline_markers.clear()
+    for m in act.pose_markers:
+        sc.timeline_markers.new(m.name, frame=m.frame)
+    return True
+
+
+class SC2_OT_play_animation(bpy.types.Operator):
+    bl_idname = 'sc2.play_animation'
+    bl_description = 'Switch the model to this animation and set the frame range to it'
+    bl_label = 'SC2 Animation'
+    bl_options = {'REGISTER', 'UNDO'}
+    name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        return {'FINISHED'} if sc2_apply_animation(self.name, context.scene) else {'CANCELLED'}
+
+
+def sc2_draw(self, context):
+    sc = context.scene
+    current = sc.get('sc2_animation', '')
+    col = self.layout.column(align=True)
+    for name in sc.get('sc2_animations', []):
+        act = bpy.data.actions.get(name)
+        if act is None:
+            continue
+        length = int(round(act.frame_range[1] - act.frame_range[0]))
+        op = col.operator('sc2.play_animation', text=f'{name}  ({length})', depress=(name == current),
+                          icon='PLAY' if name == current else ('FILE_REFRESH' if act.use_cyclic else 'ACTION'))
+        op.name = name
+
+
+def sc2_panel(space):
+    return type('SC2_PT_animations_' + space.lower(), (bpy.types.Panel,), {
+        'bl_label': 'SC2 Animations', 'bl_space_type': space, 'bl_region_type': 'UI',
+        'bl_category': 'SC2', 'draw': sc2_draw})
+
+
+for cls in (SC2_OT_play_animation, sc2_panel('VIEW_3D'), sc2_panel('DOPESHEET_EDITOR'), sc2_panel('NLA_EDITOR')):
+    old = getattr(bpy.types, cls.__name__, None)
+    if old is not None:
+        try:
+            bpy.utils.unregister_class(old)
+        except RuntimeError:
+            pass
+    bpy.utils.register_class(cls)
+"""
+
+
+def _copy_fcurves(src, bag):
+    groups = {}
+    for fc in fcurves_of(src):
+        nf = bag.fcurves.new(fc.data_path, index=fc.array_index)
+        if fc.group is not None:
+            if fc.group.name not in groups:
+                groups[fc.group.name] = bag.groups.new(fc.group.name)
+            nf.group = groups[fc.group.name]
+        n = len(fc.keyframe_points)
+        nf.keyframe_points.add(n)
+        for attr, size, zero in (('co', 2, 0.0), ('handle_left', 2, 0.0), ('handle_right', 2, 0.0),
+                                 ('interpolation', 1, 0), ('handle_left_type', 1, 0), ('handle_right_type', 1, 0)):
+            buf = [zero] * (n * size)
+            fc.keyframe_points.foreach_get(attr, buf)
+            nf.keyframe_points.foreach_set(attr, buf)
+        nf.extrapolation = fc.extrapolation
+        nf.update()
+
+
+def merge_slots(name, parts):
+    """One action with a slot per animated ID (Blender 4.4+ slotted actions).
+    parts = [(id type, slot name, source action)]; the source actions are removed."""
+    act = bpy.data.actions.new(name)
+    act.use_fake_user = True
+    strip = act.layers.new('Layer').strips.new(type='KEYFRAME')
+    for id_type, slot_name, src in parts:
+        slot = act.slots.new(id_type=id_type, name=slot_name)
+        _copy_fcurves(src, strip.channelbag(slot, ensure=True))
+        bpy.data.actions.remove(src)
+    act['sc2_animation'] = True
+    return act
+
+
+def build_blend_actions(ob, sequences, defaults, layer_defaults, targets_by_mat, vis, placed, clips, report):
+    """The .blend's animations as actions: one per sequence plus "All Animations" (every sequence end
+    to end, as on the .dae's timeline, with a pose marker per clip). Each action has a slot for every
+    animated ID: the armature (bones), the material node trees (layer animations) and the mesh
+    objects (visibility). -> action names, in order; None if this Blender has no slotted actions."""
+    if not hasattr(bpy.types, 'ActionSlot'):
+        return None
+    all_placed = [(s_, 0) for s_ in sequences]
+    vis_on = vis is not None
+
+    def parts_for(bones_act, placed_, tag):
+        parts = [('OBJECT', ob.name, bones_act)]
+        mats, meshes = [], []
+        if targets_by_mat:
+            n = sm.build_material_actions(targets_by_mat, layer_defaults, placed_, build_action,
+                                          all_placed=all_placed, out=mats, name='{mat}_' + tag)
+            if placed_ is placed:
+                report['animated_materials'] = n
+        if vis_on:
+            vis.keyframe_objects(placed_, all_placed=all_placed, out=meshes, name='{mesh}_' + tag)
+        parts += [('NODETREE', mat.name, a) for mat, a in mats]
+        parts += [('OBJECT', mob.name, a) for mob, a in meshes]
+        return parts
+
+    names = []
+    for seq in sequences:
+        tag = seq['name']
+        act = merge_slots(tag, parts_for(build_action(tag + '_bones', defaults, [(seq, 0)]), [(seq, 0)], tag))
+        act.use_frame_range = True
+        act.frame_start, act.frame_end = 0, max(seq['play_length'], 0)
+        act.use_cyclic = bool(seq.get('looping'))
+        names.append(act.name)
+    if placed:
+        act = merge_slots(ALL_ANIMATIONS, parts_for(build_action('_timeline_bones', defaults, placed), placed,
+                                                    'timeline'))
+        act.use_frame_range = True
+        act.frame_start, act.frame_end = 0, int(clips[-1]['frame_end'])
+        for c in clips:
+            act.pose_markers.new(c['name']).frame = int(c['frame_start'])
+        names.append(act.name)
+    return names
+
+
+def apply_blend_animation(names):
+    """Store the switcher script + animation list in the .blend and switch to its default animation
+    (Stand if there is one)."""
+    ns = {}
+    exec(compile(ANIM_SWITCHER, 'sc2_animations.py', 'exec'), ns)
+    txt = bpy.data.texts.new('sc2_animations.py')
+    txt.write(ANIM_SWITCHER)
+    txt.use_module = True
+    sc = bpy.context.scene
+    sc['sc2_animations'] = names
+    default = next((n for n in names if n.lower() == 'stand'), names[0])
+    ns['sc2_apply_animation'](default, sc)
 
 
 def setup_viewer(ob, meshes, clips, timeline_act):
@@ -1244,11 +1441,25 @@ def convert_model(m3s, model, tex_map, opts):
     restore_uvs(uv_backup)
 
     if opts.get('save_blend'):
-        build_blend_materials(mesh_materials, tex_map, set(opts.get('equirect', [])), report, normal_mode,
-                              animated_paths, layer_defaults, placed if timeline_act else [])
-        if vis_on and timeline_act is not None:
-            vis.keyframe_objects(placed)
+        anim_names = None
+        if sequences and hasattr(bpy.types, 'ActionSlot'):
+            # one action per animation (+ "All Animations"), switched with the saved panel script
+            targets_by_mat = build_blend_materials(mesh_materials, tex_map, set(opts.get('equirect', [])), report,
+                                                   normal_mode, animated_paths, layer_defaults, [])
+            if timeline_act is not None:
+                ob.animation_data.action = None
+                bpy.data.actions.remove(timeline_act)
+                timeline_act = None
+            anim_names = build_blend_actions(ob, sequences, defaults, layer_defaults, targets_by_mat,
+                                             vis if vis_on else None, placed, clips, report)
+        else:
+            build_blend_materials(mesh_materials, tex_map, set(opts.get('equirect', [])), report, normal_mode,
+                                  animated_paths, layer_defaults, placed if timeline_act else [])
+            if vis_on and timeline_act is not None:
+                vis.keyframe_objects(placed)
         setup_viewer(ob, region_meshes, clips if timeline_act else [], timeline_act)
+        if anim_names:
+            apply_blend_animation(anim_names)
         blend_path = os.path.abspath(os.path.splitext(model['dae'])[0] + '.blend')
         # store texture paths relative to the .blend ("//Foo.png") so the folder can be moved/shared
         for img in bpy.data.images:
