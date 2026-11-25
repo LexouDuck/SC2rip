@@ -168,7 +168,7 @@ Check `_containers.tsv` and `_plan.tsv` (see "Things to verify" below). Then try
 
 ```sh
 python3 sc2rip.py --game "$GAME" --out ~/sc2rip_out --blender "$BLENDER" \
-    --filter 'Marine|Nexus' --save-blend
+    --filter 'Marine|Nexus'
 ```
 
 Then the whole thing:
@@ -181,9 +181,9 @@ For Units only or buildings only, use `--categories units` or `--categories buil
 
 **Re-running / interrupting.** You can stop with Ctrl+C and run the same command again: folders
 that already finished are skipped. A folder only counts as finished if it was converted **with the
-same options** (e.g. `--save-blend`, `--anim-mode`, `--normal-maps`, `--no-obj`) and by the same
-version of sc2rip, and all its output files are still there. Otherwise it's redone. So adding
-`--save-blend` to a re-run redoes everything to add the .blend files. `--force` redoes everything
+same options** (e.g. `--no-blend`, `--anim-mode`, `--normal-maps`, `--no-obj`) and by the same
+version of sc2rip, and all its output files are still there. Otherwise it's redone. So removing
+`--no-blend` from a re-run redoes everything to add the .blend files. `--force` redoes everything
 regardless.
 
 ### Useful options
@@ -198,10 +198,11 @@ regardless.
 | `--anim-mode timeline\|separate\|both\|none` | see below (default `timeline`) |
 | `--anim-sampling N` | sample every N frames (base rate 30 fps). Use 2 to halve animated file sizes. |
 | `--normal-maps raw\|rgb` | `raw` keeps SC2's DXT5nm layout (X in alpha, Y in green); `rgb` rebuilds a standard (OpenGL/Blender-convention) normal map |
-| `--save-blend` | also save a ready-to-view `.blend` per model (see "Viewing in Blender") |
+| `--no-dae` | don't write the `.dae` files |
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
 | `--no-glb` | don't write the `.glb` files |
-| `--team-colors LIST` | `.glb` team colour(s): the first is baked in, the rest become material variants (see "glTF extensions") |
+| `--no-blend` | don't save the ready-to-view `.blend` per model (see "Viewing in Blender") |
+| `--team-colors LIST` | `.glb` team colour(s): the first is baked in, the rest become material variants (default `none`: plain textures; see "glTF extensions") |
 | `--glb-texture-anims safe\|all\|none` | which texture animations go in the `.glb` (see "glTF extensions") |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
 | `--terrain-texture auto\|ID\|PATH\|none` | stand-in for the map terrain on terrain materials (see "Terrain materials") |
@@ -275,8 +276,11 @@ validator. It holds:
   switch, pick an action in the Dope Sheet's Action Editor, or turn on Preferences → Add-ons →
   glTF 2.0 → "Animation UI" for a "glTF" tab in the Dope Sheet sidebar that switches everything
   (bones, morph weights, materials) at once. Then set the frame range to the animation: in the
-  Dope Sheet, select all keys (A) and View → Set Preview Range to Selected (Ctrl+Alt+P). The
-  `.blend` (`--save-blend`) does all this for you;
+  Dope Sheet, select all keys (A) and View → Set Preview Range to Selected (Ctrl+Alt+P). In the
+  `.blend`, picking one action switches everything (see "Viewing in Blender").
+  Blender's importer also shows the bones as spheres drawn in front of the mesh: that's its
+  default bone display; tick "Disable Bone Shape" (Bones section of the import options) for
+  regular bones, and turn off Object Properties → Viewport Display → In Front;
 * **mesh visibility**: parts that SC2 shows or hides per animation (death debris variants, the
   Stargate's work/unpowered effects) get a morph target called `hidden` (weight 1 = hidden),
   switched on and off by each animation. Unlike the `.dae`'s bone trick, this works for any mesh.
@@ -303,14 +307,16 @@ a viewer that doesn't know one ignores it and shows the rest.
 | `KHR_materials_unlit` | glow/effect materials | lit like other surfaces |
 
 **Team colour.** The team-coloured parts of the diffuse texture (and team-coloured glows) are baked
-with the first colour of `--team-colors` (default `red`). Every further colour is stored as a
+with the first colour of `--team-colors` (by default none: the plain texture, as in the `.dae`/`.obj`).
+Every further colour is stored as a
 **material variant**: the textures are baked once per colour, and viewers that support variants
 can switch between them: Blender (turn on **Material Variants** in Edit › Preferences › Add-ons ›
 glTF 2.0, then use the **glTF Variants** tab of the 3D Viewport sidebar), `<model-viewer>`,
 Babylon.js.
 
 ```sh
---team-colors red                  # default: red only
+--team-colors none                 # default: plain textures, no team colour
+--team-colors red                  # red only
 --team-colors red,blue,none        # red, plus variants Blue and "No Team Colour" (plain textures)
 --team-colors all                  # all 15 SC2 player colours
 --team-colors "#ff8800,light grey" # any colour as #rrggbb
@@ -375,22 +381,22 @@ animations of glows (see above). For the full SC2 look, use the `.blend`.
 
 ## Viewing in Blender
 
-With `--save-blend`, each `.blend` is set up to open ready to look at:
+Each `.blend` (unless `--no-blend`) is set up to open ready to look at:
 
 * the viewport is in **Material Preview** mode (Blender's built-in studio HDRI lighting), framed on
   the model;
 * textures use paths relative to the `.blend`, so the folder can be moved or shared;
-* **every animation is its own action** ("Stand", "Walk", "Attack 01"...), with its frame range
-  and looping flag set, plus **"All Animations"**: every animation end to end, as on the `.dae`'s
-  timeline, with a named marker at the start of each. Each action animates everything the
-  animation changes: the bones, the **texture animations** (see below) and which meshes are shown.
-  The file opens on "Stand" with the frame range set to it, so space plays it in a loop;
-* an **SC2 Animations panel** (sidebar N → "SC2" tab, in the 3D View, Dope Sheet and NLA editor)
-  lists the animations: click one to switch every part of the model to it and set the frame range
-  to it. The panel is a small script saved in the file (`sc2_animations.py`), so Blender asks before
-  running it ("Allow Execution" in the bar at the top, or Text Editor → Run Script). Without it,
-  pick an action in the Dope Sheet's Action Editor: that switches the skeleton only, and the frame
-  range must then be set by hand;
+* **every animation is its own action** of the armature ("Stand", "Walk", "Attack 01"...), with
+  its frame range and looping flag set, plus **"All Animations"**: every animation end to end, as
+  on the `.dae`'s timeline. The file opens on "All Animations", with the frame range covering it
+  and a named marker at the start of each animation (space to play; Shift+arrow keys or the
+  marker menu to jump between them);
+* to play one animation: with the armature selected (it is, when the file opens), pick its action
+  in the Dope Sheet's **Action Editor**. Everything the animation changes follows: the bones, the
+  **texture animations** (see below) and which meshes are shown (those are keyed on custom
+  properties of the armature, "mat: ..." and "vis: ...", which drivers pass on to the materials and
+  meshes; no script involved). To loop it, set the frame range to it: select all keys (A), then
+  View → Set Preview Range to Selected (Ctrl+Alt+P);
 * a sun lamp (named "Light") and a neutral grey world are included for **Rendered** mode (Z → Rendered).
 
 ### SC2-style materials

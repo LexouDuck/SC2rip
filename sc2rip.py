@@ -909,16 +909,17 @@ def main():
     out.add_argument('--anim-sampling', type=int, default=1, help='sample every N frames (30 fps base)')
     out.add_argument('--normal-maps', default='raw', choices=['raw', 'rgb'],
                      help="raw: keep SC2's DXT5nm layout; rgb: rebuild a standard RGB normal map")
-    out.add_argument('--save-blend', action='store_true',
-                     help='also save a ready-to-view .blend next to each .dae')
-    out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl files next to the .dae files")
-    out.add_argument('--no-glb', action='store_true', help="don't write .glb (glTF binary) files next to the .dae files")
-    out.add_argument('--team-colors', default='red', metavar='LIST',
+    out.add_argument('--no-dae', action='store_true', help="don't write .dae (COLLADA) files")
+    out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl (Wavefront) files")
+    out.add_argument('--no-glb', action='store_true', help="don't write .glb (glTF binary) files")
+    out.add_argument('--no-blend', action='store_true', help="don't save a ready-to-view .blend per model")
+    out.add_argument('--save-blend', action='store_true', help=argparse.SUPPRESS)  # old option, now the default
+    out.add_argument('--team-colors', default='none', metavar='LIST',
                      help='.glb team colours: the first is baked into the materials, the others become '
                           'material variants (KHR_materials_variants). Comma-separated SC2 player colour names '
                           '(red, blue, teal, purple, yellow, orange, green, "light pink", violet, "light grey", '
                           '"dark green", brown, "light green", "dark grey", pink), #rrggbb, none (plain '
-                          'texture) or all. Default: red')
+                          'texture) or all. Default: none')
     out.add_argument('--glb-texture-anims', choices=('safe', 'all', 'none'), default='safe',
                      help='texture (UV) animations in the .glb: safe = only those Blender\'s glTF importer '
                           'can read (diffuse textures of lit materials); all = also glows, emission, normal and '
@@ -949,6 +950,8 @@ def main():
     if not args.out:
         ap.error('the following arguments are required: --out')
     try:
+        if args.no_dae and args.no_obj and args.no_glb and args.no_blend and not args.list_only:
+            ap.error('--no-dae, --no-obj, --no-glb and --no-blend: nothing left to write')
         team_colors.parse(args.team_colors)
     except ValueError as e:
         ap.error(f'--team-colors: {e}')
@@ -1258,15 +1261,15 @@ def main():
 
     # ---- 4. convert
     options = {'anim_mode': args.anim_mode, 'sampling_rate': args.anim_sampling,
-               'save_blend': args.save_blend, 'skip_empty': not args.keep_empty, 'animations': True,
-               'obj': not args.no_obj, 'glb': not args.no_glb, 'team_colors': args.team_colors,
+               'save_blend': not args.no_blend, 'skip_empty': not args.keep_empty, 'animations': True,
+               'dae': not args.no_dae, 'obj': not args.no_obj, 'glb': not args.no_glb, 'team_colors': args.team_colors,
                'glb_texture_anims': args.glb_texture_anims,
                'normal_maps': args.normal_maps,
                'converter_version': CONVERTER_VERSION, 'blender_version': bl_version}
 
     def expected_outputs(m):
         base = os.path.splitext(m['dae'])[0]
-        outs = [m['dae']]
+        outs = [m['dae']] if options['dae'] else []
         if options['obj']:
             outs += [base + '.obj', base + '.mtl']
         if options['glb']:
@@ -1343,7 +1346,7 @@ def main():
                 err = r.get('error', '') or r.get('skipped', '')
                 report_rows.append(dict(
                     folder=job['folder'], model=m['rel'], status=status,
-                    dae=os.path.relpath(m['dae'], args.out) if status == 'ok' else '',
+                    dae=os.path.relpath(m['dae'], args.out) if status == 'ok' and options['dae'] else '',
                     animations=len(r.get('animations', [])), meshes=r.get('meshes', ''),
                     bones=r.get('bones', ''), missing_textures=';'.join(r.get('missing_textures', [])),
                     warnings=len(r.get('warnings', [])), terrain=r.get('terrain', ''),
