@@ -124,6 +124,8 @@ regardless.
 | `--save-blend` | also save a ready-to-view `.blend` per model (see "Viewing in Blender") |
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
 | `--no-glb` | don't write the `.glb` files |
+| `--team-colors LIST` | `.glb` team colour(s): the first is baked in, the rest become material variants (see "glTF extensions") |
+| `--glb-texture-anims safe\|all\|none` | which texture animations go in the `.glb` (see "glTF extensions") |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
 | `--terrain-texture auto\|ID\|PATH\|none` | stand-in for the map terrain on terrain materials (see "Terrain materials") |
 | `--terrain-tile N` | game units covered by one repeat of that texture (default 4) |
@@ -202,12 +204,49 @@ validator. It holds:
   * glow/effect materials as **unlit**, so they show at full brightness whatever the lighting;
   * alpha-tested cut-outs as alpha **mask** (with SC2's threshold), blended ones as alpha **blend**;
   * **two-sided** materials;
-  * no metalness, medium roughness.
+  * no metalness; roughness from SC2's glossiness.
 
-What the `.glb` can't carry, like the `.dae`/`.obj`: SC2's own shading (environment reflections,
-specular maps), **team colour** (team-coloured areas show the plain diffuse texture), texture
-animations, and true additive blending (glows are alpha-blended, with the alpha set so that they
-look right over dark backgrounds). For the full SC2 look, use the `.blend`.
+### glTF extensions
+
+What core glTF can't express is stored with standard Khronos extensions. They're all optional:
+a viewer that doesn't know one ignores it and shows the rest.
+
+| Extension | What it holds | Without support |
+|---|---|---|
+| `KHR_materials_specular` | the **specular map** (colour and strength of the highlight), with SC2's glossiness as roughness. Materials without a specular layer get no highlight, as in game | default plastic-like highlight |
+| `KHR_materials_variants` | **team colours**: see below | only the default team colour |
+| `KHR_texture_transform` + `KHR_animation_pointer` | **texture animations**: scrolling/rotating/scaling UVs, and brightness pulses/fades, keyed in each animation like the bones | textures don't move |
+| `KHR_materials_unlit` | glow/effect materials | lit like other surfaces |
+
+**Team colour.** The team-coloured parts of the diffuse texture (and team-coloured glows) are baked
+with the first colour of `--team-colors` (default `red`). Every further colour is stored as a
+**material variant**: the textures are baked once per colour, and viewers that support variants
+can switch between them: Blender (turn on **Material Variants** in Edit › Preferences › Add-ons ›
+glTF 2.0, then use the **glTF Variants** tab of the 3D Viewport sidebar), `<model-viewer>`,
+Babylon.js.
+
+```sh
+--team-colors red                  # default: red only
+--team-colors red,blue,none        # red, plus variants Blue and "No Team Colour" (plain textures)
+--team-colors all                  # all 15 SC2 player colours
+--team-colors "#ff8800,light grey" # any colour as #rrggbb
+```
+
+Each extra variant adds a copy of the model's team-coloured textures to the file (the Stargate:
+4 MB with `red`, 7.7 MB with `red,blue,none`, 33 MB with `all`).
+
+**Texture animations and Blender.** Blender's glTF importer (4.5 and 5.x) reads these, but has
+bugs that make the whole import fail on some of them: texture animation of glow (unlit),
+emission, normal or specular textures, and brightness animation of lit diffuse textures. So by
+default (`--glb-texture-anims safe`), the `.glb` only animates what Blender imports correctly:
+scrolling/rotating diffuse textures of lit materials, and brightness of glows and emission. Most
+SC2 texture animations are on glows, so those stay still. `--glb-texture-anims all` writes all of
+them, for other viewers (Babylon.js, the Khronos glTF Sample Viewer), but **those files won't
+import into Blender**. `none` writes none.
+
+What the `.glb` can't carry: SC2's environment reflections, true additive blending (glows are
+alpha-blended, with the alpha set so that they look right over dark backgrounds), and texture
+animations of glows (see above). For the full SC2 look, use the `.blend`.
 
 ## Viewing in Blender
 
@@ -314,9 +353,9 @@ normal maps instead.
 
 Animated layer properties (scrolling, rotating or scaling UVs, brightness/colour pulses) are keyed
 on the material nodes, on the same timeline and with the same markers as the skeleton, so they play
-along with each animation in the `.blend`. **They're not in the `.dae`, `.obj` or `.glb`**: COLLADA
-and OBJ have no standard way to store texture animation. glTF has a recent extension for it
-(`KHR_animation_pointer`), but few viewers support it yet.
+along with each animation in the `.blend`. **They're not in the `.dae` or `.obj`**: COLLADA and OBJ
+have no standard way to store texture animation. The `.glb` has part of them (see "glTF
+extensions").
 
 ## What's in the .dae / .obj
 
@@ -411,8 +450,10 @@ If something fails, the useful bits to send back are `_containers.tsv`, the firs
 sc2rip.py           main script (run this)
 blender_convert.py  runs inside Blender: M3 import, animation merge, COLLADA/OBJ export, .blend
 sc2_material.py     runs inside Blender: export materials and the SC2-style .blend materials
-glb_export.py       runs inside Blender: the .glb (meshes, skin, animations, visibility, materials)
+glb_export.py       runs inside Blender: the .glb (meshes, skin, animations, visibility)
+glb_materials.py    runs inside Blender: .glb materials, team colours, texture animations
 gltf_writer.py      plain-Python glTF 2.0 binary writer used by glb_export.py
+team_colors.py      SC2 player colours and the --team-colors option
 casc.py             CASC (CascLib) and extracted-folder readers
 tools/casclib/      CascLib builds (MIT licence)
 tools/m3studio/     M3Studio add-on by Solstice245, unmodified (GPL-2.0-or-later)

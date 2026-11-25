@@ -915,11 +915,33 @@ def setup_viewer(ob, meshes, clips, timeline_act):
 # Per-model conversion
 # --------------------------------------------------------------------------------------
 
-def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, defaults, placed,
-                     timeline_act, vis, fps, opts, report):
-    """Write <model>.glb. Samples every sequence on one timeline action (the .dae's when there is
-    one), then puts the armature's animation back the way it was."""
+def _get_prop(ob, path, idx):
+    try:
+        v = ob.path_resolve(path)
+    except ValueError:
+        return None
+    try:
+        return float(v[idx])
+    except TypeError:
+        return float(v)
+
+
+def _set_prop(ob, path, idx, value):
+    owner_path, prop = path.rsplit('.', 1)
+    owner = ob.path_resolve(owner_path)
+    cur = getattr(owner, prop)
+    try:
+        cur[idx] = value
+    except TypeError:
+        setattr(owner, prop, value)
+
+
+def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, defaults, layer_defaults,
+                     placed, vis, fps, opts, report):
+    """Write <model>.glb. Samples every sequence (bones and material layers) on one timeline
+    action, then puts the armature's animation and the layers back the way they were."""
     import glb_export
+    import glb_materials
     stem = os.path.splitext(os.path.basename(model['dae']))[0]
     ad = ob.animation_data
     prev = (ad.action if ad else None, getattr(ad, 'action_slot', None) if ad else None)
@@ -934,10 +956,27 @@ def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, 
             off += seq['length'] + gap
     clips = [{'name': seq['name'], 'seq': seq, 'offset': off, 'frame_start': off,
               'frame_end': off + seq['play_length']} for seq, off in placed]
-    act = timeline_act
-    if clips and act is None:
-        act = build_action(stem + '_glTF', defaults, placed)
+    # bone + material layer channels on one action (the .dae's timeline only has the bones)
+    layer_keys = sorted({k for seq, _ in placed for k in seq['mat_channels']} | set(layer_defaults))
+    rest_layers = {k: _get_prop(ob, *k) for k in layer_keys}
+    rest_layers = {k: v for k, v in rest_layers.items() if v is not None}
+    all_defaults = dict(defaults)
+    all_defaults.update({k: layer_defaults.get(k, v) for k, v in rest_layers.items()})
+    act = None
+    if clips:
+        act = build_action(stem + '_glTF', all_defaults,
+                           [(dict(seq, channels={**seq['channels'], **seq['mat_channels']}), off) for seq, off in placed])
         tmp_actions.append(act)
+    animated_layers = {}
+    for seq, _ in placed:
+        for path, _ in seq['mat_channels']:
+            owner, prop = path.rsplit('.', 1)
+            animated_layers.setdefault(owner, set()).add(prop)
+    try:
+        team = glb_materials.parse_team_colors(opts.get('team_colors', 'red'))
+    except ValueError as e:
+        report['warnings'].append(f'glTF: {e}')
+        team = glb_materials.parse_team_colors('red')
     default_act = None
     if sequences:
         default_act = build_action(stem + '_glTFDefault', defaults,
@@ -955,8 +994,14 @@ def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, 
         glb_export.export_glb(os.path.splitext(model['dae'])[0] + '.glb', ob, meshes,
                               {m[0]: m[1] for m in mesh_materials}, export_info, clips, vis, fps,
                               max(1, int(opts.get('sampling_rate', 1))), opts.get('normal_maps', 'raw'),
-                              default_pose, clip_pose, report)
+                              default_pose, clip_pose, report, team, animated_layers,
+                              opts.get('glb_texture_anims', 'safe'))
     finally:
+        for (path, idx), v in rest_layers.items():
+            try:
+                _set_prop(ob, path, idx, v)
+            except (ValueError, AttributeError, TypeError):
+                pass
         if prev[0] is not None:
             assign_action(ob, prev[0], prev_range[0], prev_range[1])
             try:
@@ -1177,8 +1222,8 @@ def convert_model(m3s, model, tex_map, opts):
     # 4) glTF binary: one animation per sequence, mesh visibility, normal maps, embedded textures
     if opts.get('glb', True):
         export_model_glb(model, ob, region_meshes, mesh_materials, export_info, sequences, defaults,
-                         placed if timeline_act else [], timeline_act, vis if vis_on else None, fps, opts,
-                         report)
+                         layer_defaults, list(placed) if timeline_act else [], vis if vis_on else None, fps,
+                         opts, report)
     restore_uvs(uv_backup)
 
     if opts.get('save_blend'):

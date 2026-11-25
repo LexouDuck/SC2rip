@@ -5,115 +5,20 @@
 * one glTF animation per SC2 sequence ("Stand", "Walk", "Death"...), sampled per frame
 * mesh visibility (death debris swapped per variant, effects shown only in some animations): a
   morph target that collapses the mesh, driven by STEP-interpolated morph weights
-* materials: glTF PBR from the same export plan as the .dae/.obj (baked colour textures with
-  transparency in alpha), plus what glTF adds over them: normal maps, emission textures, glows as
-  unlit materials, double-sided and alpha-test settings. Textures are embedded.
+* materials: see glb_materials.py (PBR + specular, texture animation and team colour extensions).
+  Textures are embedded.
 
 Blender is Z-up, glTF is Y-up: everything is written in Blender space under one root node that
 rotates it upright (skinned meshes follow it through their joints)."""
 
-import os
-import tempfile
-
 import bpy
 import numpy as np
 
-import sc2_material as sm
+from glb_materials import MaterialSet
 from gltf_writer import GLTFBuilder, FLOAT, UBYTE, USHORT, UINT, ARRAY_BUFFER, ELEMENT_ARRAY_BUFFER
 
 Y_UP = [-0.7071067811865476, 0.0, 0.0, 0.7071067811865476]   # -90 degrees about X
-ROUGHNESS = 0.6
 EPS = 1e-5
-
-
-# --------------------------------------------------------------------------- textures
-
-def _file_bytes(img):
-    path = bpy.path.abspath(img.filepath) if img is not None and img.filepath else ''
-    if not path or not os.path.isfile(path):
-        return None
-    with open(path, 'rb') as f:
-        return f.read()
-
-
-def _png_bytes(name, rgb):
-    """PNG file content for an (h, w, 3) float array (Blender's bottom-up row order)."""
-    h, w = rgb.shape[:2]
-    img = bpy.data.images.new(name, w, h, alpha=False)
-    img.colorspace_settings.name = 'Non-Color'
-    px = np.concatenate([rgb, np.ones((h, w, 1), np.float32)], axis=2)
-    img.pixels.foreach_set(px.astype(np.float32).ravel())
-    fd, tmp = tempfile.mkstemp(suffix='.png')
-    os.close(fd)
-    try:
-        img.filepath_raw = tmp
-        img.file_format = 'PNG'
-        img.save()
-        with open(tmp, 'rb') as f:
-            return f.read()
-    finally:
-        bpy.data.images.remove(img)
-        os.remove(tmp)
-
-
-def gl_normal_png(img, normal_mode):
-    """glTF normal maps are plain RGB, OpenGL convention (green up). SC2's are DirectX convention,
-    packed "DXT5nm" (X in alpha, Y in green) or plain RGB."""
-    if normal_mode == 'rgb':          # the PNG was already rebuilt in that format
-        return _file_bytes(img)
-    px = sm._pixels(img)
-    x = px[..., 3] if sm.normal_is_packed(img) else px[..., 0]
-    x = x * 2 - 1
-    y = 1 - px[..., 1] * 2            # green down -> green up
-    z = np.sqrt(np.clip(1 - x * x - y * y, 0, 1))
-    return _png_bytes(img.name + '_gl', np.stack([x, y, z], axis=2) * 0.5 + 0.5)
-
-
-# --------------------------------------------------------------------------- materials
-
-def material_entry(b, name, info, normal_mode, cache):
-    pbr = {'baseColorFactor': [0.0, 0.0, 0.0, 1.0], 'metallicFactor': 0.0, 'roughnessFactor': ROUGHNESS}
-    m = {'name': name, 'pbrMetallicRoughness': pbr}
-    if info.get('double_sided'):
-        m['doubleSided'] = True
-    if info.get('transparent'):       # distortion / volume / flare effects: not drawn
-        pbr['baseColorFactor'] = [0.0, 0.0, 0.0, 0.0]
-        m['alphaMode'] = 'BLEND'
-        return m
-    if info.get('const_color') is not None:
-        pbr['baseColorFactor'] = [float(c) for c in info['const_color'][:3]] + [1.0]
-
-    def tex(img, kind='color'):
-        key = (img.name, kind)
-        if key not in cache:
-            data = _file_bytes(img) if kind == 'color' else gl_normal_png(img, normal_mode)
-            cache[key] = b.texture(data, key, img.name) if data else None
-        return cache[key]
-
-    base = info.get('base_image')
-    t = tex(base) if base is not None else None
-    if t is not None:
-        pbr['baseColorFactor'] = [1.0, 1.0, 1.0, 1.0]
-        pbr['baseColorTexture'] = {'index': t}
-        kind = info.get('alpha_kind')
-        if kind in ('blend', 'additive'):
-            m['alphaMode'] = 'BLEND'
-        elif kind == 'mask':
-            m['alphaMode'] = 'MASK'
-            m['alphaCutoff'] = round(info.get('alpha_cutoff', 0.5), 4)
-    if info.get('unlit'):
-        m['extensions'] = {'KHR_materials_unlit': {}}
-        return m
-    eimg = info.get('emission_image')
-    te = tex(eimg) if eimg is not None else None
-    if te is not None:
-        m['emissiveTexture'] = {'index': te}
-        m['emissiveFactor'] = [1.0, 1.0, 1.0]
-    nimg = info.get('normal_image')
-    tn = tex(nimg, 'normal') if nimg is not None else None
-    if tn is not None:
-        m['normalTexture'] = {'index': tn}
-    return m
 
 
 # --------------------------------------------------------------------------- geometry
@@ -190,9 +95,10 @@ def mesh_arrays(mob, bone_index, fallback_joint):
 
 # --------------------------------------------------------------------------- animation sampling
 
-def sample_pose(ob, bones, frames):
+def sample_pose(ob, bones, frames, extra=None):
     """Local TRS of every bone (root bones: relative to the scene, armature transform included)
-    at each frame -> (T [F, J, 3], R [F, J, 4] xyzw, S [F, J, 3])."""
+    at each frame -> (T [F, J, 3], R [F, J, 4] xyzw, S [F, J, 3]). extra(): called at each frame,
+    its results are returned as a 4th item."""
     sc = bpy.context.scene
     pbs = [ob.pose.bones[bn.name] for bn in bones]
     obw = ob.matrix_world.copy()
@@ -202,6 +108,7 @@ def sample_pose(ob, bones, frames):
     T = np.zeros((len(frames), len(bones), 3), np.float32)
     R = np.zeros((len(frames), len(bones), 4), np.float32)
     S = np.ones((len(frames), len(bones), 3), np.float32)
+    extras = []
     try:
         for i, f in enumerate(frames):
             if f is not None:
@@ -213,10 +120,12 @@ def sample_pose(ob, bones, frames):
                 T[i, j] = t
                 R[i, j] = (q.x, q.y, q.z, q.w)
                 S[i, j] = s
+            if extra is not None:
+                extras.append(extra())
     finally:
         for m in mods:
             m.show_viewport = True
-    return T, R, S
+    return T, R, S, extras
 
 
 def _continuous(q, ref):
@@ -233,18 +142,20 @@ def _continuous(q, ref):
 # --------------------------------------------------------------------------- export
 
 def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, step, normal_mode,
-               default_pose, clip_pose, report):
+               default_pose, clip_pose, report, team_colors=(), animated_layers=None, texture_anims='safe'):
     """meshes: region mesh objects; mesh_material: {mesh: material name}; export_info: {material
     name: info from sc2_material.build_export_material}; clips: [{'name', 'seq', 'offset',
     'frame_start', 'frame_end'}] on one timeline; default_pose / clip_pose: callables that assign
-    the default-pose action / the clips' timeline action; vis: Visibility or None."""
+    the default-pose action / the clips' timeline action; vis: Visibility or None;
+    team_colors: [(name, linear rgb or None)], the first is baked into the default materials;
+    animated_layers: {layer path: {animated property names}}."""
     b = GLTFBuilder(f'sc2rip (Blender {bpy.app.version_string})')
     bones = list(ob.data.bones)
     bone_index = {bn.name: i for i, bn in enumerate(bones)}
 
     # ---- default pose = node transforms
     default_pose()
-    T0, R0, S0 = sample_pose(ob, bones, [None])
+    T0, R0, S0, _ = sample_pose(ob, bones, [None])
     T0, R0, S0 = T0[0], R0[0], S0[0]
 
     root = b.node(name=ob.name, rotation=Y_UP, children=[])
@@ -265,9 +176,9 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
                        'inverseBindMatrices': b.accessor(ibm, 'MAT4')})
 
     # ---- materials
-    mat_index, tex_cache = {}, {}
-    for name, info in export_info.items():
-        mat_index[name] = b.material(material_entry(b, name, info, normal_mode, tex_cache))
+    mats = MaterialSet(b, normal_mode, list(team_colors), animated_layers or {}, report, texture_anims)
+    mat_index = {name: mats.add(name, info) for name, info in export_info.items()}
+    variant_maps = mats.finish()
 
     # ---- meshes
     hideable = {}           # mesh node -> (mesh object, default weight)
@@ -293,6 +204,8 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
         mname = mesh_material.get(mob)
         if mname in mat_index:
             prim['material'] = mat_index[mname]
+            if mname in variant_maps:
+                prim['extensions'] = {'KHR_materials_variants': {'mappings': variant_maps[mname]}}
         mesh = {'name': mob.name, 'primitives': [prim]}
         hide = vis is not None and vis.batch_bones.get(mob.name) and (
             not vis.mesh_visible({}, mob.name, 0) or
@@ -315,7 +228,7 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
     b.doc['scenes'][0]['nodes'] = scene_nodes
 
     # ---- animations
-    if clips and bones:
+    if clips:
         frames, frame_ix = [], {}
         for c in clips:
             fs = list(np.arange(c['frame_start'], c['frame_end'] + 1e-6, step))
@@ -327,12 +240,18 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
                     frame_ix[f] = len(frames)
                     frames.append(f)
         clip_pose()
-        T, R, S = sample_pose(ob, bones, frames)
+        T, R, S, mat_vals = sample_pose(ob, bones, frames, mats.sample_targets)
         # channels that move in any clip are written in every clip (constant where they don't move),
         # so switching animations in a viewer never leaves a bone where the previous one put it
-        moving = {'translation': np.abs(T - T0).max(axis=(0, 2)) > EPS,
-                  'scale': np.abs(S - S0).max(axis=(0, 2)) > EPS,
-                  'rotation': np.minimum(np.abs(R - R0).max(axis=2), np.abs(R + R0).max(axis=2)).max(axis=0) > EPS}
+        # material properties animated in any clip
+        pointers = [p for p in (mat_vals[0] if mat_vals else {})
+                    if any(np.abs(np.array(v[p]) - np.array(mat_vals[0][p])).max() > EPS for v in mat_vals)]
+        if bones:
+            moving = {'translation': np.abs(T - T0).max(axis=(0, 2)) > EPS,
+                      'scale': np.abs(S - S0).max(axis=(0, 2)) > EPS,
+                      'rotation': np.minimum(np.abs(R - R0).max(axis=2), np.abs(R + R0).max(axis=2)).max(axis=0) > EPS}
+        else:
+            moving = {k: np.zeros(0, bool) for k in ('translation', 'scale', 'rotation')}
         for c in clips:
             ix = [frame_ix[f] for f in c['_frames']]
             times = (np.array(c['_frames']) - c['frame_start']) / fps
@@ -343,6 +262,7 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
 
             def add(node, prop, values, interp='LINEAR', input_acc=None, constant=False):
                 nonlocal t_acc, t0_acc
+                values = np.asarray(values, np.float32)
                 if constant:          # one key at the start
                     if t0_acc is None:
                         t0_acc = b.accessor(np.zeros(1, np.float32), 'SCALAR', FLOAT, minmax=True)
@@ -351,9 +271,15 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
                     if t_acc is None:
                         t_acc = b.accessor(times.astype(np.float32), 'SCALAR', FLOAT, minmax=True)
                     input_acc = t_acc
-                type_ = {'translation': 'VEC3', 'scale': 'VEC3', 'rotation': 'VEC4', 'weights': 'SCALAR'}[prop]
+                if prop.startswith('/'):          # KHR_animation_pointer target
+                    type_ = {1: 'SCALAR', 2: 'VEC2', 3: 'VEC3', 4: 'VEC4'}[values.shape[1]]
+                    target = {'path': 'pointer', 'extensions': {'KHR_animation_pointer': {'pointer': prop}}}
+                    b.extension('KHR_animation_pointer')
+                else:
+                    type_ = {'translation': 'VEC3', 'scale': 'VEC3', 'rotation': 'VEC4', 'weights': 'SCALAR'}[prop]
+                    target = {'node': node, 'path': prop}
                 samplers.append({'input': input_acc, 'output': b.accessor(values, type_), 'interpolation': interp})
-                channels.append({'sampler': len(samplers) - 1, 'target': {'node': node, 'path': prop}})
+                channels.append({'sampler': len(samplers) - 1, 'target': target})
 
             for j in range(len(bones)):
                 r = _continuous(R[ix, j], R0[j])
@@ -371,8 +297,15 @@ def export_glb(path, ob, meshes, mesh_material, export_info, clips, vis, fps, st
                 kt = np.array([k[0] for k in keys], np.float32)
                 add(node, 'weights', np.array([k[1] for k in keys], np.float32), 'STEP',
                     input_acc=b.accessor(kt, 'SCALAR', FLOAT, minmax=True))
-            if not channels:          # keep the (static) animation listed: one constant key
-                add(joint_nodes[0], 'translation', np.repeat(T0[:1], len(times), axis=0))
+            for pointer in pointers:
+                vals = np.array([mat_vals[i][pointer] for i in ix], np.float32)
+                if pointer.endswith('/rotation'):
+                    vals = np.unwrap(vals, axis=0)
+                add(None, pointer, vals, constant=np.abs(vals - vals[:1]).max() <= EPS)
+            if not channels and joint_nodes:      # keep the (static) animation listed: one constant key
+                add(joint_nodes[0], 'translation', np.repeat(T0[:1], len(times), axis=0), constant=True)
+            if not channels:
+                continue
             b.animation({'name': c['name'], 'channels': channels, 'samplers': samplers})
 
     size = b.write(path)

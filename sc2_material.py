@@ -376,6 +376,23 @@ def export_plan(layers, m3mat, mtype):
                 break
     plan['hdr_emis'] = float(getattr(m3mat, 'hdr_emis', 1.0) or 1.0)
     plan['double_sided'] = bool(getattr(m3mat, 'two_sided', False))
+    # for the glTF export: specular map, team colour
+    main = plan['main']
+    spec = layers.get('specular')
+    plan['spec_layer'] = spec if (spec is not None and layer_bitmap(spec) and main is not None
+                                  and same_mapping(spec, main)) else None
+    plan['specularity'] = float(getattr(m3mat, 'specularity', 20.0) or 20.0)
+    plan['hdr_spec'] = float(getattr(m3mat, 'hdr_spec', 1.0) or 1.0)
+    plan['spec_mode'] = getattr(m3mat, 'spec_mode', 'RGB')
+    plan['lit'] = not plan['glow'] and plan['role'] in ('diffuse', 'decal')
+    plan['team_mask'] = plan['role'] == 'diffuse' and getattr(main, 'color_channels', '') == 'ARGB'
+    plan['team_emis'] = []
+    if plan['role'] in ('diffuse', 'decal'):
+        for role, mode_attr in (('emissive', 'blend_mode_emis1'), ('emissive2', 'blend_mode_emis2')):
+            el = layers.get(role)
+            if el is not None and layer_bitmap(el) and getattr(m3mat, mode_attr, 'ADD') in ('TEAMEMIS', 'TEAMDIFF') \
+                    and same_mapping(el, main):
+                plan['team_emis'].append(el)
     plan['alpha_cutoff'] = (getattr(m3mat, 'alpha_test_threshold', 0) or 128) / 255.0
     blend = getattr(m3mat, 'blend_mode', 'OPAQUE')
     if blend in ('ADD', 'ALPHAA'):
@@ -503,7 +520,12 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
             'transparent': plan['transparent'], 'const_color': plan['const_color'],
             'double_sided': plan.get('double_sided', False), 'alpha_cutoff': plan.get('alpha_cutoff', 0.5),
             'base_image': None, 'alpha_kind': None, 'unlit': False, 'emission_image': None,
-            'normal_image': None}
+            'normal_image': None, 'main_layer': None, 'main_raw_image': None, 'main_ops': None,
+            'emissive_layer': None, 'emissive_ops': None, 'normal_layer': None,
+            'spec_layer': None, 'spec_image': None, 'spec_ops': None,
+            'specularity': plan.get('specularity', 20.0), 'hdr_spec': plan.get('hdr_spec', 1.0),
+            'spec_mode': plan.get('spec_mode', 'RGB'), 'lit': plan.get('lit', False),
+            'team_mask': plan.get('team_mask', False), 'team_emis': []}
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -573,6 +595,18 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
     info['base_image'] = use_img
     info['alpha_kind'] = plan['alpha'] if has_alpha else None
     info['unlit'] = bool(plan['glow'])
+    info.update(main_layer=main, main_raw_image=img, main_ops=main_ops)
+    sl = plan.get('spec_layer')
+    if sl is not None:
+        simg = load_image(tex_map.get(norm_tex_key(layer_bitmap(sl))))
+        if simg is not None:
+            info.update(spec_layer=sl, spec_image=simg, spec_ops=layer_ops(sl, peaks))
+    for tl in plan.get('team_emis', []):
+        timg = load_image(tex_map.get(norm_tex_key(layer_bitmap(tl))))
+        if timg is not None:
+            tops = layer_ops(tl, peaks)
+            tops['post'] = plan.get('hdr_emis', 1.0)
+            info['team_emis'].append((tl, timg, tops))
     tex = nt.nodes.new('ShaderNodeTexImage')
     tex.image = use_img
     tex.location = (-600, 300)
@@ -607,7 +641,7 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
                         derive_texture(path, eimg, eops, None)
                         _DERIVED[sig] = path
                     use_e = load_image(path)
-                info['emission_image'] = use_e
+                info.update(emission_image=use_e, emissive_layer=el, emissive_ops=eops)
                 enode = nt.nodes.new('ShaderNodeTexImage')
                 enode.image = use_e
                 enode.location = (-600, -300)
@@ -619,7 +653,7 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
             report['missing_textures'].add(layer_bitmap(el))
     if normal_layer is not None and layer_bitmap(normal_layer) and same_mapping(normal_layer, main):
         nimg = load_image(tex_map.get(norm_tex_key(layer_bitmap(normal_layer))), non_color=True)
-        info['normal_image'] = nimg
+        info.update(normal_image=nimg, normal_layer=normal_layer)
         if nimg is not None and normal_mode == 'rgb':
             ntex = nt.nodes.new('ShaderNodeTexImage')
             ntex.image = nimg

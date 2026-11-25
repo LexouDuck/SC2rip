@@ -34,6 +34,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
+import team_colors  # noqa: E402
 
 CONVERTER_VERSION = '8'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
@@ -555,6 +556,16 @@ def main():
                      help='also save a ready-to-view .blend next to each .dae')
     out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl files next to the .dae files")
     out.add_argument('--no-glb', action='store_true', help="don't write .glb (glTF binary) files next to the .dae files")
+    out.add_argument('--team-colors', default='red', metavar='LIST',
+                     help='.glb team colours: the first is baked into the materials, the others become '
+                          'material variants (KHR_materials_variants). Comma-separated SC2 player colour names '
+                          '(red, blue, teal, purple, yellow, orange, green, "light pink", violet, "light grey", '
+                          '"dark green", brown, "light green", "dark grey", pink), #rrggbb, none (plain '
+                          'texture) or all. Default: red')
+    out.add_argument('--glb-texture-anims', choices=('safe', 'all', 'none'), default='safe',
+                     help='texture (UV) animations in the .glb: safe = only those Blender\'s glTF importer '
+                          'can read (diffuse textures of lit materials); all = also glows, emission, normal and '
+                          'specular maps (crashes Blender\'s importer: for other viewers); none. Default: safe')
     out.add_argument('--keep-empty', action='store_true', help='export models that have no geometry')
     out.add_argument('--terrain-texture', default='auto', metavar='ID|PATH|auto|none',
                      help='stand-in for the map terrain shown by terrain materials (the ground around '
@@ -580,6 +591,10 @@ def main():
         return
     if not args.out:
         ap.error('the following arguments are required: --out')
+    try:
+        team_colors.parse(args.team_colors)
+    except ValueError as e:
+        ap.error(f'--team-colors: {e}')
 
     args.categories = [c.strip().lower() for c in args.categories.split(',') if c.strip()]
     args.sources = [s.strip().lower() for s in args.sources.split(',') if s.strip()]
@@ -860,7 +875,9 @@ def main():
     # ---- 4. convert
     options = {'anim_mode': args.anim_mode, 'sampling_rate': args.anim_sampling,
                'save_blend': args.save_blend, 'skip_empty': not args.keep_empty, 'animations': True,
-               'obj': not args.no_obj, 'glb': not args.no_glb, 'normal_maps': args.normal_maps,
+               'obj': not args.no_obj, 'glb': not args.no_glb, 'team_colors': args.team_colors,
+               'glb_texture_anims': args.glb_texture_anims,
+               'normal_maps': args.normal_maps,
                'converter_version': CONVERTER_VERSION, 'blender_version': bl_version}
 
     def expected_outputs(m):
