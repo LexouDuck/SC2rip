@@ -165,18 +165,18 @@ class MaterialSet:
         return layer is not None and bool(self.animated.get(sm.layer_path(layer), set())
                                           & {'color_brightness', 'color_multiply'})
 
-    def slot_animatable(self, slot, unlit):
-        """Blender's glTF importer (4.5 and 5.x) fails on some material animations: texture
-        transforms of emissive/normal/specular textures (4.5) and of unlit base colour (5.x), and
-        the base colour factor of lit textured materials (4.5). 'safe' only writes what both
-        import: texture transforms of lit base colour textures, unlit base colour factors and
-        emissive factors. slot: 'base' / 'emissive' / 'normal' / 'specular' (texture transform),
-        'base_factor' / 'emissive_factor'."""
+    def slot_animatable(self, slot, unlit, blended=False):
+        """Blender's glTF importer aborts the whole import on some material animations (tested
+        on 4.2 to 5.3, see README "glTF extension support"). 'safe' only writes what every
+        version imports: texture transforms of lit base colour textures, emissive factors, and
+        base colour factors of alpha-blended unlit materials. slot: 'base' / 'emissive' /
+        'normal' / 'specular' (texture transform), 'base_factor' / 'emissive_factor'."""
         if self.texture_anims == 'all':
             return True
         if self.texture_anims == 'none':
             return False
-        return (slot == 'base' and not unlit) or (slot == 'base_factor' and unlit) or slot == 'emissive_factor'
+        return ((slot == 'base' and not unlit) or (slot == 'base_factor' and unlit and blended)
+                or slot == 'emissive_factor')
 
     def _texinfo(self, index, layer, slot, unlit):
         ti = {'index': index}
@@ -323,7 +323,8 @@ class MaterialSet:
             if self._uv_animated(layer) and self.slot_animatable(slot, unlit) \
                     and sm.static_uv(layer)[0] == sm.static_uv(main)[0]:
                 self.slot_anims.append((idx, slot, layer, np.linalg.inv(rest)))
-        if self._color_animated(main) and info.get('main_ops') and self.slot_animatable('base_factor', unlit):
+        blended = info.get('alpha_kind') in ('blend', 'additive')
+        if self._color_animated(main) and info.get('main_ops') and self.slot_animatable('base_factor', unlit, blended):
             kind = 'alpha' if info.get('alpha_kind') == 'additive' else 'rgb'
             self.factor_anims.append((idx, 'base_' + kind, main, info['main_ops']['scale']))
         el = info.get('emissive_layer')

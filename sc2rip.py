@@ -68,7 +68,7 @@ CONTAINER_RULES = [
     (r'campaigns/[^/]+', 'campaign', None, None),
     (r'mods/(alliedcommanders|coop[^/]*|[^/]*commander[^/]*)\.sc2mod', 'coop', 'Co-op', None),
 ]
-GROUP_ORDER = ['melee', 'campaign', 'coop', 'other']
+GROUP_ORDER = ['melee', 'campaign', 'coop', 'other', 'unused']
 
 ASSET_RE = re.compile(
     r'^(?P<container>.+?)/(?:(?P<pkg>[^/]+\.sc2assets)/)?assets/(?P<cat>units|buildings)/(?P<rel>.+)$')
@@ -105,7 +105,8 @@ def safe(s):
 # --------------------------------------------------------------------------------------
 
 class ModelFile:
-    __slots__ = ('path', 'lc', 'container', 'group', 'label', 'prio', 'cat', 'rel', 'ext')
+    __slots__ = ('path', 'lc', 'container', 'group', 'label', 'prio', 'cat', 'rel', 'ext',
+                 'out_group', 'out_label', 'refs')
 
     def __init__(self, path, m):
         self.path = path
@@ -115,18 +116,24 @@ class ModelFile:
         self.cat = m.group('cat').lower()
         self.rel = path[m.start('rel'):]          # original case
         self.ext = self.lc.rsplit('.', 1)[-1]
+        # where the model is filed in the output: by default where it is stored, see classify_by_data()
+        self.out_group, self.out_label = self.group, self.label
+        self.refs = None
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
 
 
 def scan(storage, categories):
-    """-> (unit/building model files, {texture key: [storage paths]}, [TerrainTexData.xml paths])"""
-    models, textures, terrain_data = [], {}, []
+    """-> (unit/building model files, {texture key: [storage paths]}, [TerrainTexData.xml paths],
+    [every game data .xml path])"""
+    models, textures, terrain_data, game_data = [], {}, [], []
     for p in storage.files():
         lc = p.lower()
-        if lc.endswith('terraintexdata.xml') and TERRAIN_DATA_RE.match(lc):
-            terrain_data.append(p)
+        if lc.endswith('.xml') and '.sc2data/gamedata/' in lc:
+            game_data.append(p)
+            if lc.endswith('terraintexdata.xml') and TERRAIN_DATA_RE.match(lc):
+                terrain_data.append(p)
         elif lc.endswith(('.m3', '.m3a')):
             m = ASSET_RE.match(lc)
             # localized packages (zhcn.sc2assets, ...) hold regional variants of base models with the
@@ -138,7 +145,7 @@ def scan(storage, categories):
             if i >= 0:
                 textures.setdefault(lc[i:], []).append(p)
             textures.setdefault('::base::' + lc.rsplit('/', 1)[-1], []).append(p)
-    return models, textures, terrain_data
+    return models, textures, terrain_data, game_data
 
 
 def container_of(path_lc):
@@ -171,6 +178,114 @@ def resolve_texture(ref, textures, container, melee_order):
             return (localized, 1, rank[c])
         return (localized, 2, 0)
     return sorted(cands, key=score)[0]
+
+
+# --------------------------------------------------------------------------------------
+# Sorting models by the game data that uses them
+# --------------------------------------------------------------------------------------
+# Since patch 4.0 nearly every model file is stored in mods/liberty.sc2mod, whatever uses it, so
+# where a file is stored says nothing about melee vs campaign. The game data does: each mod and
+# campaign declares the models it uses (CModel entries in its GameData .xml files, also in the
+# data of individual campaign maps). A model is filed as:
+#   Melee     used by a melee mod (core, liberty, swarm, void and their *multi mods)
+#   Campaign  otherwise, used by a campaign (the first one in CONTAINER_RULES order)
+#   Co-op     otherwise, used by a co-op mod
+#   Other     otherwise, used by another mod
+#   Unused    not referenced by any game data (cut content, or models only used by name in scripts)
+# A unit's folder is never split: the whole asset folder goes where its "best" model goes.
+
+MODELREF_RE = re.compile(rb'["\'>]\s*([^"\'<>\r\n]{1,260}?\.m3)\s*["\'<]', re.I)
+
+
+def data_owner(path_lc):
+    """The mod / campaign a game data file belongs to (campaign maps count as their campaign)."""
+    c = container_of(path_lc)
+    if c:
+        return c
+    return path_lc.split('/', 1)[0]
+
+
+def load_model_refs(storage, xml_paths, cache_path, log):
+    """{'assets/units/.../x.m3': {data containers that reference it}} from every game data .xml."""
+    sig = hashlib.sha1('\n'.join(sorted(p.lower() for p in xml_paths)).encode()).hexdigest()
+    try:
+        with open(cache_path, encoding='utf-8') as f:
+            cached = json.load(f)
+        if cached.get('sig') == sig:
+            return {k: set(v) for k, v in cached['refs'].items()}
+    except (OSError, ValueError, KeyError):
+        pass
+    refs, failed = {}, 0
+    t0 = time.time()
+    for i, p in enumerate(sorted(xml_paths)):
+        if i and i % 500 == 0:
+            log(f'  ... {i}/{len(xml_paths)} game data files')
+        try:
+            data = storage.read(p)
+        except Exception:
+            failed += 1
+            continue
+        owner = data_owner(p.lower())
+        for r in MODELREF_RE.findall(data):
+            k = r.decode('latin-1').replace('\\', '/').strip().lower()
+            j = k.find('assets/')
+            if j >= 0:
+                refs.setdefault(k[j:], set()).add(owner)
+    log(f'  read {len(xml_paths) - failed} game data files in {time.time() - t0:.0f}s'
+        + (f' ({failed} unreadable)' if failed else '') + f': {len(refs)} model paths referenced')
+    try:
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump({'sig': sig, 'refs': {k: sorted(v) for k, v in refs.items()}}, f)
+    except OSError:
+        pass
+    return refs
+
+
+def _rule_index(container_lc):
+    for i, (rx, *_rest) in enumerate(CONTAINER_RULES):
+        if re.fullmatch(rx, container_lc):
+            return i
+    return len(CONTAINER_RULES)
+
+
+def _data_rank(c):
+    return GROUP_ORDER.index(classify_container(c)[0]), _rule_index(c), c
+
+
+def data_class(containers):
+    """(group, label, rank) for a model used by these data containers."""
+    if not containers:
+        return 'unused', 'Unused', (GROUP_ORDER.index('unused'), 0, '')
+    best = min(containers, key=_data_rank)
+    group, label, _ = classify_container(best)
+    return group, label, _data_rank(best)
+
+
+def classify_by_data(models, refs, log):
+    """Set out_group / out_label / refs of every model from the game data that uses it."""
+    rank = {}
+    for m in models:
+        m.refs = sorted(refs.get(f'assets/{m.cat}/{m.rel.lower()}', ()))
+        m.out_group, m.out_label, rank[id(m)] = data_class(m.refs)
+    # keep each asset folder together: all its files go where its best .m3 goes
+    by_folder = {}
+    for m in models:
+        by_folder.setdefault(asset_folder_key(m), []).append(m)
+    for ms in by_folder.values():
+        best = min((m for m in ms if m.ext == 'm3'), default=ms[0], key=lambda m: rank[id(m)])
+        for m in ms:
+            m.out_group, m.out_label = best.out_group, best.out_label
+    counts = {}
+    for m in models:
+        if m.ext == 'm3':
+            counts[(m.out_group, m.out_label)] = counts.get((m.out_group, m.out_label), 0) + 1
+    for (g, l), n in sorted(counts.items(), key=lambda kv: (GROUP_ORDER.index(kv[0][0]), kv[0][1])):
+        log(f'  {g:8s} {l:40s} {n:5d} .m3 files')
+
+
+def asset_folder_key(m):
+    parts = m.rel.lower().split('/')
+    return (m.cat, parts[0], parts[1] if len(parts) >= 3 else os.path.splitext(parts[-1])[0])
 
 
 # --------------------------------------------------------------------------------------
@@ -257,7 +372,7 @@ def build_plan(models, args, log):
         wanted = [c.lower().replace('\\', '/').strip('/') for c in args.containers]
         models = [m for m in models if m.container.lower() in wanted]
     else:
-        models = [m for m in models if m.group in groups]
+        models = [m for m in models if m.out_group in groups]
 
     # melee: apply SC2's override order so each relative path resolves to one file
     melee_order = sorted({(m.prio, m.container.lower()) for m in models if m.group == 'melee'})
@@ -277,14 +392,17 @@ def folder_for(m):
     stem = os.path.splitext(parts[-1])[0]
     unit = pretty(parts[1], stem) if len(parts) >= 3 else pretty(stem)
     cat = 'Units' if m.cat == 'units' else 'Buildings'
-    if m.group == 'melee':
+    group, label = m.out_group, m.out_label
+    if group == 'melee':
         grp = 'Melee'
-    elif m.group == 'campaign':
-        grp = f'Campaign - {m.label}'
-    elif m.group == 'coop':
-        grp = f'Co-op - {m.label}' if m.label != 'Co-op' else 'Co-op'
+    elif group == 'campaign':
+        grp = f'Campaign - {label}'
+    elif group == 'coop':
+        grp = f'Co-op - {label}' if label != 'Co-op' else 'Co-op'
+    elif group == 'unused':
+        grp = 'Unused'
     else:
-        grp = f'Other - {m.label}'
+        grp = f'Other - {label}'
     return os.path.join(cat, safe(grp), safe(race), safe(unit))
 
 
@@ -531,8 +649,13 @@ def main():
     sel = ap.add_argument_group('selection')
     sel.add_argument('--categories', default='units,buildings',
                      help='comma list: units,buildings (default: both)')
-    sel.add_argument('--sources', default='melee,campaign',
-                     help='comma list of melee,campaign,coop,other (default: melee,campaign)')
+    sel.add_argument('--sources', default='melee,campaign,unused',
+                     help='comma list of melee,campaign,coop,other,unused: which models to rip, by what uses '
+                          'them (see --classify; default: melee,campaign,unused)')
+    sel.add_argument('--classify', choices=('data', 'location'), default='data',
+                     help='sort models as melee/campaign/co-op/... by the game data that uses them (data, '
+                          'default) or by the mod/campaign they are stored in (location: since patch 4.0 '
+                          'nearly everything is stored in liberty.sc2mod)')
     sel.add_argument('--containers', nargs='*',
                      help='explicit container list, overrides --sources (e.g. mods/liberty.sc2mod)')
     sel.add_argument('--filter', help='regex; only output folders whose path matches (case-insensitive)')
@@ -619,7 +742,7 @@ def main():
         raise SystemExit(f'ERROR: {e}')
     log(f'Reading {storage.describe()}')
     t0 = time.time()
-    models, textures, terrain_data = scan(storage, args.categories)
+    models, textures, terrain_data, game_data = scan(storage, args.categories)
     log(f'{len(storage.files())} files in storage, {len(models)} unit/building model files '
         f'({time.time() - t0:.1f}s)')
 
@@ -635,6 +758,14 @@ def main():
             w.writerow([c, g, l, v['units'], v['buildings']])
             log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d}')
 
+    if args.classify == 'data':
+        log('Sorting models by the game data that uses them ...')
+        os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)
+        refs = load_model_refs(storage, game_data, os.path.join(args.out, '_work', 'model_refs.json'), log)
+        if refs:
+            classify_by_data(models, refs, log)
+        else:
+            log('  ! no model references found in the game data: sorting by storage location instead')
     planned, melee_order = build_plan(models, args, log)
     if args.exclude:
         rx = re.compile(args.exclude, re.I)
@@ -656,10 +787,11 @@ def main():
 
     with open(os.path.join(args.out, '_plan.tsv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f, delimiter='\t', lineterminator='\n')
-        w.writerow(['output_folder', 'storage_path', 'group', 'container'])
+        w.writerow(['output_folder', 'storage_path', 'filed_as', 'stored_in', 'used_by'])
         for k, ms in folders.items():
             for m in ms:
-                w.writerow([k, m.path, m.group, m.container])
+                w.writerow([k, m.path, m.out_group, m.container,
+                            ' '.join(m.refs) if m.refs is not None else '(not checked)'])
     n_m3 = sum(1 for ms in folders.values() for m in ms if m.ext == 'm3')
     log(f'Plan: {len(folders)} output folders, {n_m3} .m3 models (see _plan.tsv)')
 

@@ -14,29 +14,55 @@ and mesh visibility, an `.obj`/`.mtl` of the same model (static), and its textur
                                           Marine_animations.txt
     Campaign - Wings of Liberty/Terran/<campaign-only unit>/...
     Campaign - Heart of the Swarm/...  Campaign - Legacy of the Void/...  Campaign - Nova Covert Ops/...
+    Unused/...                            models no game data uses
   Buildings/
     Melee/Protoss/Nexus/...
     Campaign - .../
   (all reports are tab-separated)
   _report.tsv      one row per model: ok / error / duplicate, animation count, missing textures,
                    terrain stand-in
-  _plan.tsv        what was selected, and from which game container
+  _plan.tsv        what was selected, where it is filed, where it is stored and what uses it
   _containers.tsv  every mod/campaign that holds unit/building models, and how it was classified
   _terrain_textures.tsv  the game's terrain textures (for --terrain-texture)
   _log.txt
   _work/           scratch files (raw .m3, texture cache, per-folder Blender logs). Safe to delete.
 ```
 
-"Campaign" folders contain only models that are **not byte-identical** to a model already ripped
-from the standard (melee) data, so you get the campaign-only models without duplicates.
+Models are sorted by **what uses them** in the game data (see "Sorting: melee, campaign,
+unused"): "Melee" holds every model the standard (melee/multiplayer) data uses, "Campaign - ..."
+only models that are used by that campaign and not by the melee data.
+
+## Sorting: melee, campaign, unused
+
+Since patch 4.0, nearly every model file is stored in `mods/liberty.sc2mod`, whatever uses it: the
+folder a file is stored in says nothing about melee vs campaign. The game data does: every mod and
+campaign lists the models it uses (`CModel` entries in its `GameData` `.xml` files, including the
+data of individual campaign maps). sc2rip reads all of it and files each model as:
+
+| Folder | Models that are... |
+|---|---|
+| `Melee` | used by the melee data (`core`, `liberty`, `swarm`, `void` and their `*multi` mods) |
+| `Campaign - <campaign>` | not used by the melee data, but by a campaign (the earliest one if several: Wings of Liberty, then its story mode, Heart of the Swarm, ...) |
+| `Co-op` | used only by Co-op Commanders data |
+| `Other - <mod>` | used only by some other mod |
+| `Unused` | not used by any game data: cut content, test models, or models only named in map scripts |
+
+A unit's folder is never split: if its main model is melee, its campaign-only portrait or variant
+goes with it. `_plan.tsv` lists, for every model, where it's filed (`filed_as`), where it's stored
+(`stored_in`) and which mods/campaigns use it (`used_by`). Reading the game data takes a while the
+first time; the result is cached in `_work/model_refs.json`.
+
+`--sources` picks which of these to rip (default `melee,campaign,unused`; add `coop`, `other`).
+`--classify location` goes back to sorting by where the files are stored. sc2rip also does that
+when it finds no model references in the game data.
 
 ## How it works
 
 1. **CASC**: reads the game's storage directly with [CascLib](https://github.com/ladislav-zezula/CascLib)
    (through Python ctypes), or reads files you already extracted with CascView.
-2. **Selection**: takes every `.m3`/`.m3a` under `Assets/Units` and `Assets/Buildings` of the
-   melee mods (`core`, `liberty`, `swarm`, `void`, `*multi`, applying SC2's override order) and
-   the campaign containers (`campaigns/*`, `novacampaign`).
+2. **Selection**: takes every `.m3`/`.m3a` under `Assets/Units` and `Assets/Buildings`
+   (applying SC2's override order between the melee mods), and sorts them by the game data that
+   uses them (see "Sorting").
 3. **Textures**: finds every texture each model references, preferring the model's own
    mod/campaign. Converts DDS → PNG with Pillow, falling back to Blender's image loader.
 4. **Conversion**: runs **Blender 4.5 LTS headless** (no GUI) with the
@@ -115,7 +141,8 @@ regardless.
 | Option | Meaning |
 |---|---|
 | `--categories units,buildings` | what to rip (default: both) |
-| `--sources melee,campaign` | add `coop` for Co-op Commander models, `other` for everything else |
+| `--sources melee,campaign,unused` | which models to rip, by what uses them: add `coop` for Co-op Commander models, `other` for everything else (see "Sorting") |
+| `--classify data\|location` | sort by what uses each model (default) or by where it's stored |
 | `--containers mods/liberty.sc2mod ...` | pick exact containers (overrides `--sources`) |
 | `--filter REGEX` / `--exclude REGEX` | match output folder path / skip storage paths (e.g. `--exclude _portrait`) |
 | `--anim-mode timeline\|separate\|both\|none` | see below (default `timeline`) |
@@ -142,7 +169,7 @@ python3 sc2rip.py --game "$SC2" --find mothershipcore
 
 Each line shows the group its container is classified as (`melee`, `campaign`, `coop`, `other`) and
 notes why a model file would be skipped (outside `Assets/Units` / `Assets/Buildings`, or in a
-localized package). Models in `coop` / `other` containers are only ripped with `--sources`.
+localized package). To see what uses a model, look it up in `_plan.tsv` (`used_by`).
 
 ### Animations
 
@@ -235,14 +262,55 @@ Babylon.js.
 Each extra variant adds a copy of the model's team-coloured textures to the file (the Stargate:
 4 MB with `red`, 7.7 MB with `red,blue,none`, 33 MB with `all`).
 
-**Texture animations and Blender.** Blender's glTF importer (4.5 and 5.x) reads these, but has
-bugs that make the whole import fail on some of them: texture animation of glow (unlit),
-emission, normal or specular textures, and brightness animation of lit diffuse textures. So by
-default (`--glb-texture-anims safe`), the `.glb` only animates what Blender imports correctly:
-scrolling/rotating diffuse textures of lit materials, and brightness of glows and emission. Most
-SC2 texture animations are on glows, so those stay still. `--glb-texture-anims all` writes all of
-them, for other viewers (Babylon.js, the Khronos glTF Sample Viewer), but **those files won't
-import into Blender**. `none` writes none.
+**Texture animations and Blender.** Blender's glTF importer reads these, but has bugs that make
+the whole import fail on some of them (see the table below). So by default
+(`--glb-texture-anims safe`), the `.glb` only animates what every Blender version from 4.2 to 5.3
+imports: scrolling/rotating diffuse textures of lit materials, the brightness of emission, and the
+brightness of alpha-blended glows. Most SC2 texture animations are on glows, so those stay still.
+`--glb-texture-anims all` writes all of them, for other viewers (Babylon.js, Godot, the Khronos
+glTF Sample Viewer), but **those files won't import into Blender before 5.2**, and not into 5.3
+either when a glow's texture moves. `none` writes none.
+
+### glTF extension support in Blender and other programs
+
+**Blender** (built-in glTF importer), tested with small test files, one per feature
+(`tools/gltf-support/`, re-run them on any Blender with
+`blender -b --factory-startup --python tools/gltf-support/check.py -- <files>`). 4.2.23, 4.3.0,
+4.4.0, 4.5.17, 5.0.1 and 5.1.2 all behave the same.
+
+| Feature | 4.2 – 5.1 | 5.2.5 | 5.3.0 |
+|---|---|---|---|
+| `KHR_materials_specular`, `_unlit`, `_emissive_strength`, `_variants` | ✅ | ✅ | ✅ |
+| `KHR_texture_transform` (static, on any texture) | ✅ | ✅ | ✅ |
+| morph-target weight animation (the `hidden` visibility) | ✅ | ✅ | ✅ |
+| `KHR_node_visibility` | ignored | ignored | ignored |
+| **Animated** (`KHR_animation_pointer`): | | | |
+| texture transform, lit base colour | ✅ | ✅ | ✅ |
+| texture transform, unlit base colour (glows) | ✅ | ✅ | ❌ import fails |
+| texture transform, emission / normal / specular texture | ❌ import fails | ✅ | ✅ |
+| base colour factor, lit + textured | ❌ import fails | ✅ | ✅ |
+| base colour factor, lit, no texture | ✅ | ✅ | ✅ |
+| base colour factor, unlit + opaque | ❌ import fails | ❌ import fails | ✅ |
+| base colour factor, unlit + alpha blend | ✅ | ✅ | ✅ |
+| emissive factor, roughness factor | ✅ | ✅ | ✅ |
+| node visibility | ignored | ignored | ignored |
+
+"Import fails" means the whole file doesn't import (Python error in the importer), not just that
+one animation.
+
+**Other programs** (from their source code or documentation, not tested here):
+
+| | specular | variants | texture transform | animation pointer | unlit | node visibility |
+|---|---|---|---|---|---|---|
+| three.js r187 (`GLTFLoader`) | ✅ | plugin | ✅ | plugin (channels skipped otherwise) | ✅ | – |
+| Babylon.js 9 (sandbox) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Godot 4.4+ | – | – | ✅ | ✅ | ✅ | ✅ (recent versions) |
+| Unity glTFast 6.8 | – | ✅ | ✅ | – | ✅ | – |
+| Assimp (and tools built on it) | ✅ | – | ✅ | – | ✅ | – |
+
+"–" means the extension is ignored and the rest of the file loads. Unreal's documentation only
+lists the extensions its glTF *exporter* writes; 3ds Max has an official open-source
+importer/exporter from Khronos (2026) that covers PBR extensions, UV transforms and animation.
 
 What the `.glb` can't carry: SC2's environment reflections, true additive blending (glows are
 alpha-blended, with the alpha set so that they look right over dark backgrounds), and texture
@@ -454,6 +522,7 @@ glb_export.py       runs inside Blender: the .glb (meshes, skin, animations, vis
 glb_materials.py    runs inside Blender: .glb materials, team colours, texture animations
 gltf_writer.py      plain-Python glTF 2.0 binary writer used by glb_export.py
 team_colors.py      SC2 player colours and the --team-colors option
+tools/gltf-support/ test files + checker for glTF importer support (see "glTF extension support")
 casc.py             CASC (CascLib) and extracted-folder readers
 tools/casclib/      CascLib builds (MIT licence)
 tools/m3studio/     M3Studio add-on by Solstice245, unmodified (GPL-2.0-or-later)
