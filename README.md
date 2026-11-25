@@ -18,9 +18,11 @@ textures as `.png`.
     Melee/Protoss/Nexus/...
     Campaign - .../
   (all reports are tab-separated)
-  _report.tsv      one row per model: ok / error / duplicate, animation count, missing textures
+  _report.tsv      one row per model: ok / error / duplicate, animation count, missing textures,
+                   terrain stand-in
   _plan.tsv        what was selected, and from which game container
   _containers.tsv  every mod/campaign that holds unit/building models, and how it was classified
+  _terrain_textures.tsv  the game's terrain textures (for --terrain-texture)
   _log.txt
   _work/           scratch files (raw .m3, texture cache, per-folder Blender logs). Safe to delete.
 ```
@@ -122,7 +124,22 @@ regardless.
 | `--save-blend` | also save a ready-to-view `.blend` per model (see "Viewing in Blender") |
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
+| `--terrain-texture auto\|ID\|PATH\|none` | stand-in for the map terrain on terrain materials (see "Terrain materials") |
+| `--terrain-tile N` | game units covered by one repeat of that texture (default 4) |
+| `--find REGEX` | only list the game files whose path matches, e.g. `--find mothershipcore` (see below), then exit |
 | `--jobs N`, `--timeout S` | parallel Blender processes, per-folder time limit |
+
+**Looking for a model.** If a model you expected isn't in the output, `--find` shows where (and
+whether) its files are in the game storage. `--out` is optional here; with it, the list is also
+written to `<out>/_find.tsv`:
+
+```sh
+python3 sc2rip.py --game "$SC2" --find mothershipcore
+```
+
+Each line shows the group its container is classified as (`melee`, `campaign`, `coop`, `other`) and
+notes why a model file would be skipped (outside `Assets/Units` / `Assets/Buildings`, or in a
+localized package). Models in `coop` / `other` containers are only ripped with `--sources`.
 
 ### Animations
 
@@ -234,6 +251,24 @@ Besides standard materials, SC2 uses a few effect-only material types, rebuilt l
 * **lens flare / buffer**: invisible.
 
 In the `.dae`/`.obj` these effect materials are written **fully transparent** (alpha 0 / `d 0`).
+
+### Terrain materials
+
+Some models, like the mineral fields, have a patch of ground around them that uses SC2's
+**terrain** material. It has no texture of its own: in game it shows whatever terrain the map has
+under the model, so it blends in. To keep it from rendering black, sc2rip maps a stand-in terrain
+texture onto it, projected from above like the game does. One repeat of the texture covers
+`--terrain-tile` game units (default 4).
+
+* `--terrain-texture auto` (default) picks a plain dirt texture from the game's terrain texture
+  list. The choice is written in `_log.txt`, and the full list in `_terrain_textures.tsv`.
+* `--terrain-texture <id>` uses another one from `_terrain_textures.tsv` (e.g. a tileset that
+  matches what you're showing).
+* `--terrain-texture none` uses a plain earth colour instead.
+
+The texture's alpha channel is dropped, because terrain textures use it as a lighting mask rather
+than transparency. The `terrain` column of `_report.tsv` shows which stand-in a model got.
+Changing these options only redoes the models that have terrain materials.
 
 ### Normal maps
 

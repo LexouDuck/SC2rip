@@ -720,6 +720,24 @@ def write_anim_list(path, model_name, clips, fps):
         f.write('\n'.join(lines) + '\n')
 
 
+TERRAIN_TILE = 4.0   # game units covered by one repeat of a terrain texture
+
+
+def project_terrain_uvs(mob, tile):
+    """Replace the first UV set with a top-down projection (model X/Y / tile), the way terrain
+    textures are laid on the ground in game. Terrain materials ignore the mesh's own UVs."""
+    me = mob.data
+    uv0 = me.uv_layers[0] if me.uv_layers else me.uv_layers.new(name='uv0')
+    mw = mob.matrix_world
+    coords = [mw @ v.co for v in me.vertices]
+    uvs = []
+    for loop in me.loops:
+        co = coords[loop.vertex_index]
+        uvs += (co.x / tile, co.y / tile)
+    uv0.data.foreach_set('uv', uvs)
+    me.update()
+
+
 def bake_export_uvs(mob, layer):
     """Overwrite the first UV set with the layer's UVs (its own UV set + rest transform).
     Returns the original coordinates for restore_uvs()."""
@@ -991,6 +1009,12 @@ def convert_model(m3s, model, tex_map, opts):
         m3mat, mtype = sm.m3_material_from_ref(ob, matref, shared) if matref else (None, None)
         mat_name = matref.name if matref else f'{model_stem}_NoMaterial'
         layers = sm.collect_layers(ob, m3mat, shared)
+        if mtype == 'm3_materials_terrain' and not any(sm.layer_bitmap(l) for l in layers.values()):
+            # shows the map's terrain in game: use a stand-in terrain texture, projected from above
+            terrain = model.get('terrain') or {}
+            layers = sm.terrain_standin_layers(terrain)
+            project_terrain_uvs(mob, float(terrain.get('tile') or TERRAIN_TILE))
+            report['terrain'] = terrain.get('name') or 'colour'
         plan = sm.export_plan(layers, m3mat, mtype)
         if mat_name not in mat_cache:
             mat_cache[mat_name], export_info[mat_name] = sm.build_export_material(

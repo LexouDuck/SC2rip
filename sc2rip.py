@@ -23,10 +23,12 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -114,11 +116,17 @@ class ModelFile:
         self.ext = self.lc.rsplit('.', 1)[-1]
 
 
+TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
+
+
 def scan(storage, categories):
-    models, textures = [], {}
+    """-> (unit/building model files, {texture key: [storage paths]}, [TerrainTexData.xml paths])"""
+    models, textures, terrain_data = [], {}, []
     for p in storage.files():
         lc = p.lower()
-        if lc.endswith(('.m3', '.m3a')):
+        if lc.endswith('terraintexdata.xml') and TERRAIN_DATA_RE.match(lc):
+            terrain_data.append(p)
+        elif lc.endswith(('.m3', '.m3a')):
             m = ASSET_RE.match(lc)
             # localized packages (zhcn.sc2assets, ...) hold regional variants of base models with the
             # same file names, and usually aren't downloaded - only use the base package
@@ -129,7 +137,7 @@ def scan(storage, categories):
             if i >= 0:
                 textures.setdefault(lc[i:], []).append(p)
             textures.setdefault('::base::' + lc.rsplit('/', 1)[-1], []).append(p)
-    return models, textures
+    return models, textures, terrain_data
 
 
 def container_of(path_lc):
@@ -162,6 +170,83 @@ def resolve_texture(ref, textures, container, melee_order):
             return (localized, 1, rank[c])
         return (localized, 2, 0)
     return sorted(cands, key=score)[0]
+
+
+# --------------------------------------------------------------------------------------
+# Terrain materials
+# --------------------------------------------------------------------------------------
+# Models such as mineral fields have a "terrain" material on the ground around them: in game it
+# shows whatever terrain texture the map has there, so the model has no texture of its own.
+# A stand-in terrain texture from the game's terrain texture catalogue is used instead.
+
+def m3_has_terrain_material(data):
+    """True when an .m3 file contains a terrain material (a 'TER_' section in its index)."""
+    try:
+        _, ioff, count = struct.unpack_from('<4sII', data, 0)
+        for i in range(count):
+            if data[ioff + 16 * i: ioff + 16 * i + 4] == b'_RET':   # tags are stored reversed
+                return True
+        return False
+    except struct.error:
+        return b'_RET' in data
+
+
+def load_terrain_catalogue(storage, paths, melee_order, log):
+    """{id: {'id', 'diffuse', 'normal', 'container'}} from every TerrainTexData.xml. Melee mods are
+    read last, in their override order, so their definitions win."""
+    rank = {c: i for i, c in enumerate(melee_order)}
+    paths = sorted(paths, key=lambda p: (container_of(p.lower()) in rank,
+                                         rank.get(container_of(p.lower()), 0), p.lower()))
+    raw = {}
+    for path in paths:
+        try:
+            root = ET.fromstring(storage.read(path))
+        except Exception as e:
+            log(f'  ! cannot read {path}: {e}')
+            continue
+        for el in root.iter():
+            if el.tag != 'CTerrainTex' or not el.get('id'):
+                continue
+            e = raw.setdefault(el.get('id'), {'id': el.get('id'), 'container': container_of(path.lower())})
+            if el.get('parent'):
+                e['parent'] = el.get('parent')
+            for child in el:
+                tag, val = child.tag.lower(), (child.get('value') or '').strip()
+                if val and tag == 'texture':
+                    e['diffuse'] = val
+                elif val and tag == 'normalmap':
+                    e['normal'] = val
+    for e in raw.values():          # inherit texture fields from parent entries
+        p, seen = e.get('parent'), set()
+        while p and p in raw and p not in seen:
+            seen.add(p)
+            for k in ('diffuse', 'normal'):
+                if k not in e and k in raw[p]:
+                    e[k] = raw[p][k]
+            p = raw[p].get('parent')
+    return {k: v for k, v in raw.items() if v.get('diffuse')}
+
+
+TERRAIN_KEYWORDS = ('dirt', 'soil', 'sand', 'ground', 'gravel', 'ash', 'rock')
+TERRAIN_AVOID = ('creep', 'lava', 'water', 'snow', 'ice', 'space', 'metal', 'tile', 'grate', 'plate',
+                 'road', 'grass', 'moss', 'blood', 'acid', 'glow', 'crystal', 'test', 'black', 'white')
+TERRAIN_TILESETS = ('belshir', 'agria', 'marsara', 'char', 'redstone', 'tarsonis', 'avernus')
+
+
+def pick_terrain_texture(catalogue):
+    """A plain earth texture: ids with 'dirt' first (then soil, sand...), favouring common melee
+    tilesets, then the shortest name."""
+    best = None
+    for tid, e in catalogue.items():
+        t = tid.lower()
+        kw = next((i for i, k in enumerate(TERRAIN_KEYWORDS) if k in t), None)
+        if kw is None or any(a in t for a in TERRAIN_AVOID):
+            continue
+        ts = next((i for i, k in enumerate(TERRAIN_TILESETS) if t.startswith(k)), len(TERRAIN_TILESETS))
+        key = (kw, ts, len(t), t)
+        if best is None or key < best[0]:
+            best = (key, e)
+    return best[1] if best else None
 
 
 def build_plan(models, args, log):
@@ -404,6 +489,37 @@ def ensure_m3studio(args, log):
 # Main
 # --------------------------------------------------------------------------------------
 
+def find_files(args):
+    """--find: list matching storage paths with their container classification."""
+    try:
+        storage = casc.open_storage(args.game, args.from_extracted, args.casclib)
+    except casc.StorageError as e:
+        raise SystemExit(f'ERROR: {e}')
+    rx = re.compile(args.find, re.I)
+    rows = []
+    for p in sorted(storage.files(), key=str.lower):
+        if rx.search(p):
+            c = container_of(p.lower())
+            group, label, _ = classify_container(c)
+            m = ASSET_RE.match(p.lower())
+            note = ''
+            if p.lower().endswith(('.m3', '.m3a')):
+                if not m or m.group('cat') not in ('units', 'buildings'):
+                    note = 'not under Assets/Units or Assets/Buildings'
+                elif m.group('pkg') not in (None, 'base.sc2assets'):
+                    note = f'localized package {m.group("pkg")} (ignored)'
+            rows.append((p, c, group, note))
+    for p, c, group, note in rows:
+        print(f'{group:8s}  {p}' + (f'   [{note}]' if note else ''))
+    print(f'{len(rows)} matching files out of {len(storage.files())}', file=sys.stderr)
+    if args.out:
+        os.makedirs(args.out, exist_ok=True)
+        with open(os.path.join(args.out, '_find.tsv'), 'w', newline='', encoding='utf-8') as f:
+            w = csv.writer(f, delimiter='\t', lineterminator='\n')
+            w.writerow(['storage_path', 'container', 'group', 'note'])
+            w.writerows(rows)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     src = ap.add_argument_group('input')
@@ -423,8 +539,11 @@ def main():
     sel.add_argument('--no-dedupe', action='store_true',
                      help='keep campaign/co-op models that are byte-identical to an already-ripped one')
     sel.add_argument('--limit', type=int, default=0, help='only process the first N folders (testing)')
+    sel.add_argument('--find', metavar='REGEX',
+                     help='only list the files in the game storage whose path matches (case-insensitive), '
+                          'e.g. --find mothershipcore, and exit')
     out = ap.add_argument_group('output')
-    out.add_argument('--out', required=True, help='output folder')
+    out.add_argument('--out', help='output folder (required, except with --find)')
     out.add_argument('--work', help='scratch folder (default: <out>/_work)')
     out.add_argument('--anim-mode', default='timeline', choices=['timeline', 'separate', 'both', 'none'],
                      help='timeline: one .dae per model with every animation on one timeline + clip '
@@ -436,6 +555,12 @@ def main():
                      help='also save a ready-to-view .blend next to each .dae')
     out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl files next to the .dae files")
     out.add_argument('--keep-empty', action='store_true', help='export models that have no geometry')
+    out.add_argument('--terrain-texture', default='auto', metavar='ID|PATH|auto|none',
+                     help='stand-in for the map terrain shown by terrain materials (the ground around '
+                          'mineral fields...): auto (a plain dirt texture from the game), a terrain texture '
+                          'id from _terrain_textures.tsv, a texture path in the game, or none (plain colour)')
+    out.add_argument('--terrain-tile', type=float, default=4.0,
+                     help='game units covered by one repeat of the terrain texture (default 4)')
     tools = ap.add_argument_group('tools')
     tools.add_argument('--blender', help='Blender 4.5 LTS executable (5.x has no COLLADA)')
     tools.add_argument('--bpy-python', help='alternative to --blender: a Python 3.11 with "bpy==4.5.*" installed')
@@ -449,6 +574,11 @@ def main():
                      help='only scan and write <out>/_plan.tsv + container summary (no extraction)')
     run.add_argument('--force', action='store_true', help='redo folders that already finished')
     args = ap.parse_args()
+    if args.find:
+        find_files(args)
+        return
+    if not args.out:
+        ap.error('the following arguments are required: --out')
 
     args.categories = [c.strip().lower() for c in args.categories.split(',') if c.strip()]
     args.sources = [s.strip().lower() for s in args.sources.split(',') if s.strip()]
@@ -473,7 +603,7 @@ def main():
         raise SystemExit(f'ERROR: {e}')
     log(f'Reading {storage.describe()}')
     t0 = time.time()
-    models, textures = scan(storage, args.categories)
+    models, textures, terrain_data = scan(storage, args.categories)
     log(f'{len(storage.files())} files in storage, {len(models)} unit/building model files '
         f'({time.time() - t0:.1f}s)')
 
@@ -516,6 +646,34 @@ def main():
                 w.writerow([k, m.path, m.group, m.container])
     n_m3 = sum(1 for ms in folders.values() for m in ms if m.ext == 'm3')
     log(f'Plan: {len(folders)} output folders, {n_m3} .m3 models (see _plan.tsv)')
+
+    # stand-in texture for terrain materials (see "Terrain materials" above)
+    catalogue = load_terrain_catalogue(storage, terrain_data, melee_order, log)
+    with open(os.path.join(args.out, '_terrain_textures.tsv'), 'w', newline='', encoding='utf-8') as f:
+        w = csv.writer(f, delimiter='\t', lineterminator='\n')
+        w.writerow(['id', 'texture', 'normal_map', 'container'])
+        for tid in sorted(catalogue, key=str.lower):
+            e = catalogue[tid]
+            w.writerow([tid, e['diffuse'], e.get('normal', ''), e['container']])
+    choice = args.terrain_texture.strip()
+    terrain = None
+    if choice.lower() == 'auto':
+        terrain = pick_terrain_texture(catalogue)
+    elif choice.lower() != 'none':
+        terrain = next((e for k, e in catalogue.items() if k.lower() == choice.lower()), None)
+        if terrain is None:
+            if re.search(r'[\\/]|\.(dds|tga|png)$', choice, re.I):
+                terrain = {'id': os.path.splitext(re.split(r'[\\/]', choice)[-1])[0], 'diffuse': choice}
+            else:
+                log(f'  ! --terrain-texture: no terrain texture "{choice}" (see _terrain_textures.tsv)')
+    if terrain is not None and not resolve_texture(terrain['diffuse'], textures, '', melee_order):
+        log(f'  ! terrain texture {terrain["diffuse"]} not found in the game files')
+        terrain = None
+    if terrain is not None:
+        log(f'Terrain materials: stand-in texture "{terrain["id"]}" ({terrain["diffuse"]}), '
+            f'{len(catalogue)} available (see _terrain_textures.tsv)')
+    else:
+        log('Terrain materials: plain earth colour (no stand-in texture)')
     if args.list_only:
         return
 
@@ -579,6 +737,38 @@ def main():
         tex_cache[spath] = dst
         return dst
 
+    def add_texture(ref, container, tex_map, used_png_names, out_folder, no_alpha=False):
+        """Convert the texture a model references (if not done yet) and add it to the folder's
+        texture map. Returns its output file name, or None if it can't be found / read."""
+        key = ref.replace('/', '\\').strip().lower()
+        if key in tex_map:
+            return os.path.basename(tex_map[key][1])
+        spath = resolve_texture(ref, textures, container, melee_order)
+        if not spath:
+            return None
+        png = get_png(spath)
+        if not png:
+            return None
+        if no_alpha:
+            png = png_without_alpha(png)
+        name = os.path.splitext(spath.split('/')[-1])[0]
+        name = pretty(name, os.path.splitext(ref.replace('\\', '/').split('/')[-1])[0])
+        fname = name + '.png'
+        if used_png_names.get(fname.lower(), spath) != spath:
+            fname = f'{name}_{hashlib.sha1(spath.encode()).hexdigest()[:6]}.png'
+        used_png_names[fname.lower()] = spath
+        tex_map[key] = (png, os.path.join(out_folder, fname))
+        return fname
+
+    def png_without_alpha(png):
+        """Terrain textures keep a lighting mask in their alpha channel, not transparency."""
+        dst = png[:-4] + '__rgb.png'
+        if not os.path.isfile(dst) and os.path.isfile(png):
+            from PIL import Image
+            with Image.open(png) as im:
+                im.convert('RGB').save(dst)
+        return dst if os.path.isfile(dst) else png
+
     log('Extracting models and textures ...')
     for fi, (folder, ms) in enumerate(folder_items):
         out_folder = os.path.join(args.out, folder)
@@ -616,22 +806,21 @@ def main():
             # textures referenced by this model
             refs = sorted({r.decode('latin-1') for r in TEXREF_RE.findall(data)})
             for ref in refs:
-                key = ref.replace('/', '\\').strip().lower()
-                if key in tex_map:
-                    continue
-                spath = resolve_texture(ref, textures, m.container, melee_order)
-                if not spath:
-                    continue
-                png = get_png(spath)
-                if not png:
-                    continue
-                name = os.path.splitext(spath.split('/')[-1])[0]
-                name = pretty(name, os.path.splitext(ref.replace('\\', '/').split('/')[-1])[0])
-                fname = name + '.png'
-                if used_png_names.get(fname.lower(), spath) != spath:
-                    fname = f'{name}_{hashlib.sha1(spath.encode()).hexdigest()[:6]}.png'
-                used_png_names[fname.lower()] = spath
-                tex_map[key] = (png, os.path.join(out_folder, fname))
+                add_texture(ref, m.container, tex_map, used_png_names, out_folder)
+
+            terrain_job = None
+            if m3_has_terrain_material(data):
+                terrain_job = {'name': 'colour', 'tile': args.terrain_tile}
+                if terrain is not None:
+                    terrain_job['name'] = terrain['id']
+                    for role in ('diffuse', 'normal'):
+                        ref = terrain.get(role)
+                        dst_name = add_texture(ref, m.container, tex_map, used_png_names, out_folder,
+                                               no_alpha=(role == 'diffuse')) if ref else None
+                        if dst_name:
+                            terrain_job[role] = ref
+                    if 'diffuse' not in terrain_job:
+                        terrain_job['name'] = 'colour'
 
             stem = os.path.splitext(m.rel.split('/')[-1])[0]
             # .m3a animation files in this folder belong to the model with the longest matching name
@@ -650,6 +839,8 @@ def main():
                 m3a_paths.append(araw)
             job_models.append({'m3': raw, 'm3a': m3a_paths, 'dae': os.path.join(out_folder, safe(stem) + '.dae'),
                                'storage_path': m.path, 'rel': m.rel})
+            if terrain_job is not None:
+                job_models[-1]['terrain'] = terrain_job
         if not job_models:
             continue
         jobs.append({'folder': folder, 'out_folder': out_folder, 'models': job_models, 'tex_map': tex_map})
@@ -751,12 +942,13 @@ def main():
                     dae=os.path.relpath(m['dae'], args.out) if status == 'ok' else '',
                     animations=len(r.get('animations', [])), meshes=r.get('meshes', ''),
                     bones=r.get('bones', ''), missing_textures=';'.join(r.get('missing_textures', [])),
-                    warnings=len(r.get('warnings', [])), error=err.strip().splitlines()[-1] if err else ''))
+                    warnings=len(r.get('warnings', [])), terrain=r.get('terrain', ''),
+                    error=err.strip().splitlines()[-1] if err else ''))
             log(f'  [{done}/{len(jobs)}] {job["folder"]}: {oks}/{len(job["models"])} ok ({how})')
 
     # ---- 5. report
     fields = ['folder', 'model', 'status', 'dae', 'animations', 'meshes', 'bones',
-              'missing_textures', 'warnings', 'error']
+              'missing_textures', 'warnings', 'terrain', 'error']
     with open(os.path.join(args.out, '_report.tsv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=fields, delimiter='\t', lineterminator='\n')
         w.writeheader()

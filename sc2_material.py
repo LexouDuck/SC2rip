@@ -116,6 +116,46 @@ def collect_layers(ob, m3mat, shared):
     return out
 
 
+TERRAIN_STANDIN_COLOR = (0.22, 0.17, 0.12)   # linear; a neutral earth brown, when no texture is found
+
+
+class StandInLayer:
+    """Looks like an M3 layer to the material code. Used for terrain materials, which have no
+    texture of their own: in game they show the map's terrain textures, so a stand-in terrain
+    texture (or colour) is mapped onto them instead."""
+    color_channels = 'RGB'
+    uv_source = 'UV0'
+    uv_offset = (0.0, 0.0)
+    uv_tiling = (1.0, 1.0)
+    uv_angle = (0.0, 0.0, 0.0)
+    uv_wrap_x = uv_wrap_y = True
+    uv_flipbook_rows = uv_flipbook_cols = 0
+    color_invert = color_clamp = False
+    color_brightness = color_multiply = 1.0
+    color_add = 0.0
+    fresnel_type = 'DISABLED'
+    fresnel_exponent, fresnel_min, fresnel_max = 1.0, 0.0, 1.0
+
+    def __init__(self, role, bitmap='', color=TERRAIN_STANDIN_COLOR):
+        self.role = role
+        self.color_type = 'BITMAP' if bitmap else 'COLOR'
+        self.color_bitmap = bitmap or ''
+        self.color_value = tuple(color[:3]) + (1.0,)
+
+    def path_from_id(self, prop=None):
+        return f'terrain_standin_{self.role}' + (f'.{prop}' if prop else '')
+
+
+def terrain_standin_layers(terrain):
+    """{role: layer} for a terrain material, from the job's terrain settings
+    ({'diffuse': game texture path or None, 'normal': ... or None})."""
+    layers = {'diffuse': StandInLayer('diffuse', terrain.get('diffuse') or '',
+                                      terrain.get('color') or TERRAIN_STANDIN_COLOR)}
+    if terrain.get('diffuse') and terrain.get('normal'):
+        layers['normal'] = StandInLayer('normal', terrain['normal'])
+    return layers
+
+
 def layer_bitmap(layer):
     if getattr(layer, 'color_type', 'BITMAP') != 'BITMAP':
         return ''
