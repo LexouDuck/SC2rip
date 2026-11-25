@@ -915,6 +915,63 @@ def setup_viewer(ob, meshes, clips, timeline_act):
 # Per-model conversion
 # --------------------------------------------------------------------------------------
 
+def export_model_glb(model, ob, meshes, mesh_materials, export_info, sequences, defaults, placed,
+                     timeline_act, vis, fps, opts, report):
+    """Write <model>.glb. Samples every sequence on one timeline action (the .dae's when there is
+    one), then puts the armature's animation back the way it was."""
+    import glb_export
+    stem = os.path.splitext(os.path.basename(model['dae']))[0]
+    ad = ob.animation_data
+    prev = (ad.action if ad else None, getattr(ad, 'action_slot', None) if ad else None)
+    sc = bpy.context.scene
+    prev_range = (sc.frame_start, sc.frame_end, sc.frame_current)
+    tmp_actions = []
+    gap = int(opts.get('anim_gap', 1))
+    if sequences and not placed:
+        off = 0
+        for seq in sequences:
+            placed.append((seq, off))
+            off += seq['length'] + gap
+    clips = [{'name': seq['name'], 'seq': seq, 'offset': off, 'frame_start': off,
+              'frame_end': off + seq['play_length']} for seq, off in placed]
+    act = timeline_act
+    if clips and act is None:
+        act = build_action(stem + '_glTF', defaults, placed)
+        tmp_actions.append(act)
+    default_act = None
+    if sequences:
+        default_act = build_action(stem + '_glTFDefault', defaults,
+                                   [(dict(sequences[0], channels={}, length=1, play_length=1), 0)])
+        tmp_actions.append(default_act)
+
+    def default_pose():
+        if default_act is not None:
+            assign_action(ob, default_act, 0, 1)
+
+    def clip_pose():
+        assign_action(ob, act, 0, clips[-1]['frame_end'])
+
+    try:
+        glb_export.export_glb(os.path.splitext(model['dae'])[0] + '.glb', ob, meshes,
+                              {m[0]: m[1] for m in mesh_materials}, export_info, clips, vis, fps,
+                              max(1, int(opts.get('sampling_rate', 1))), opts.get('normal_maps', 'raw'),
+                              default_pose, clip_pose, report)
+    finally:
+        if prev[0] is not None:
+            assign_action(ob, prev[0], prev_range[0], prev_range[1])
+            try:
+                if prev[1] is not None:
+                    ob.animation_data.action_slot = prev[1]
+            except (AttributeError, TypeError):
+                pass
+        elif ob.animation_data:
+            ob.animation_data.action = None
+        sc.frame_start, sc.frame_end = prev_range[0], prev_range[1]
+        sc.frame_set(prev_range[2])
+        for a in tmp_actions:
+            bpy.data.actions.remove(a)
+
+
 def convert_model(m3s, model, tex_map, opts):
     shared = m3s.shared
     io_imp = sys.modules[m3s.__name__ + '.io_m3_import']
@@ -957,6 +1014,11 @@ def convert_model(m3s, model, tex_map, opts):
         for (path, idx), pts in seq['mat_channels'].items():
             if idx == 0 and pts:
                 anim_peaks[path] = max(anim_peaks.get(path, float('-inf')), max(v for _, v, _ in pts))
+    # a sequence that doesn't animate the property shows its default value (e.g. a glow that is
+    # faded to 0 by every other animation, and simply left on in "Stand Work")
+    for (path, idx), value in layer_defaults.items():
+        if idx == 0 and path in anim_peaks and any((path, idx) not in seq['mat_channels'] for seq in sequences):
+            anim_peaks[path] = max(anim_peaks[path], value)
     normal_mode = opts.get('normal_maps', 'raw')
 
     model_stem = os.path.splitext(os.path.basename(model['dae']))[0]
@@ -1111,6 +1173,12 @@ def convert_model(m3s, model, tex_map, opts):
         for name, info in export_info.items():
             sm.set_export_emission(mat_cache[name], info, True)
         export_obj(os.path.splitext(model['dae'])[0] + '.obj', region_meshes)
+
+    # 4) glTF binary: one animation per sequence, mesh visibility, normal maps, embedded textures
+    if opts.get('glb', True):
+        export_model_glb(model, ob, region_meshes, mesh_materials, export_info, sequences, defaults,
+                         placed if timeline_act else [], timeline_act, vis if vis_on else None, fps, opts,
+                         report)
     restore_uvs(uv_backup)
 
     if opts.get('save_blend'):

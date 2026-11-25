@@ -1,15 +1,15 @@
-# sc2rip: StarCraft II unit & building models → COLLADA + PNG
+# sc2rip: StarCraft II unit & building models → COLLADA + glTF + PNG
 
 Batch-rips every unit and building model from an installed copy of StarCraft II into
 **one folder per unit/building**. Each folder holds a `.dae` file per model, with skeleton, skin
-weights, materials and **all animations**, an `.obj`/`.mtl` of the same model (static), and its
-textures as `.png`.
+weights, materials and **all animations**, a `.glb` (glTF binary) with the same plus normal maps
+and mesh visibility, an `.obj`/`.mtl` of the same model (static), and its textures as `.png`.
 
 ```
 <out>/
   Units/
-    Melee/Terran/Marine/                  Marine.dae, Marine.obj, Marine.mtl,
-                                          Marine_Portrait.dae, Marine_Portrait.obj, ...
+    Melee/Terran/Marine/                  Marine.dae, Marine.glb, Marine.obj, Marine.mtl,
+                                          Marine_Portrait.dae, Marine_Portrait.glb, ...
                                           Marine_Diffuse.png, Marine_Normal.png, ...
                                           Marine_animations.txt
     Campaign - Wings of Liberty/Terran/<campaign-only unit>/...
@@ -123,6 +123,7 @@ regardless.
 | `--normal-maps raw\|rgb` | `raw` keeps SC2's DXT5nm layout (X in alpha, Y in green); `rgb` rebuilds a standard (OpenGL/Blender-convention) normal map |
 | `--save-blend` | also save a ready-to-view `.blend` per model (see "Viewing in Blender") |
 | `--no-obj` | don't write the `.obj`/`.mtl` files |
+| `--no-glb` | don't write the `.glb` files |
 | `--no-dedupe` | keep campaign models that are identical to melee ones |
 | `--terrain-texture auto\|ID\|PATH\|none` | stand-in for the map terrain on terrain materials (see "Terrain materials") |
 | `--terrain-tile N` | game units covered by one repeat of that texture (default 4) |
@@ -178,6 +179,35 @@ Each model also gets a Wavefront `.obj` + `.mtl`. OBJ can't store a skeleton or 
 the model in its **bind pose** (the pose the mesh is stored in), Y-up as is usual for OBJ, with
 every part included. Materials are described under "What's in the .dae / .obj". The normal map is
 only referenced with `--normal-maps rgb`, since no OBJ viewer understands SC2's packed normal maps.
+
+## glTF (.glb) files
+
+Each model also gets a `.glb`: a single self-contained glTF 2.0 file (textures embedded), the
+format most current tools and web viewers read best. It's written by sc2rip directly from the
+converted scene (not by Blender's glTF exporter), and every file passes the official Khronos glTF
+validator. It holds:
+
+* the **mesh, skeleton and skin weights**, Y-up;
+* **one glTF animation per SC2 animation** ("Stand", "Walk", "Attack 01", "Death 02", ...), named
+  as in game, sampled per frame (`--anim-sampling` applies). The node transforms (what you see
+  without playing anything) are the model's default pose;
+* **mesh visibility**: parts that SC2 shows or hides per animation (death debris variants, the
+  Stargate's work/unpowered effects) get a morph target called `hidden` (weight 1 = hidden),
+  switched on and off by each animation. Unlike the `.dae`'s bone trick, this works for any mesh.
+  A part that is hidden at rest has weight 1 by default;
+* **materials** built from the same textures as the `.dae`/`.obj` (see "What's in the .dae / .obj"),
+  plus what glTF can carry that they can't:
+  * the **normal map**, converted to the standard glTF (OpenGL) format, with tangents;
+  * the **glow** (emissive) texture;
+  * glow/effect materials as **unlit**, so they show at full brightness whatever the lighting;
+  * alpha-tested cut-outs as alpha **mask** (with SC2's threshold), blended ones as alpha **blend**;
+  * **two-sided** materials;
+  * no metalness, medium roughness.
+
+What the `.glb` can't carry, like the `.dae`/`.obj`: SC2's own shading (environment reflections,
+specular maps), **team colour** (team-coloured areas show the plain diffuse texture), texture
+animations, and true additive blending (glows are alpha-blended, with the alpha set so that they
+look right over dark backgrounds). For the full SC2 look, use the `.blend`.
 
 ## Viewing in Blender
 
@@ -284,8 +314,9 @@ normal maps instead.
 
 Animated layer properties (scrolling, rotating or scaling UVs, brightness/colour pulses) are keyed
 on the material nodes, on the same timeline and with the same markers as the skeleton, so they play
-along with each animation in the `.blend`. **They can't be carried in the `.dae` or `.obj`**: COLLADA
-and OBJ have no standard way to store texture animation, and no common importer would read it.
+along with each animation in the `.blend`. **They're not in the `.dae`, `.obj` or `.glb`**: COLLADA
+and OBJ have no standard way to store texture animation. glTF has a recent extension for it
+(`KHR_animation_pointer`), but few viewers support it yet.
 
 ## What's in the .dae / .obj
 
@@ -298,8 +329,9 @@ material is reduced to that:
 * **alpha**:
   * alpha-masked (cut-out) and alpha-blended materials get their alpha mask;
   * **additive** materials (glows that add light) get alpha = brightness, so their black parts
-    are see-through. OBJ/COLLADA can't do true additive blending, so glows are alpha-blended
-    over what's behind them instead;
+    are see-through. OBJ/COLLADA/glTF can't do true additive blending, so glows are alpha-blended
+    over what's behind them instead. The colour is brightened to match, so that over a black
+    background a glow looks exactly as in game;
 * **colour operations** the layer applies in game (brightness, multiply, add, clamp, the glow's
   HDR strength) are baked into the texture. Animated brightness (effects that fade in, or are off
   at rest like the Stargate's halo) is baked at the **strongest value it reaches**;
@@ -340,15 +372,15 @@ IDs and empty sections that Blender's exporter gets wrong.
 
 ## Opening the files in other programs
 
-| | .blend | .obj | .dae |
-|---|---|---|---|
-| Blender 4.5 | everything | mesh, textures, alpha, glow | mesh & textures. **Alpha is ignored and bone animation is misread by Blender's COLLADA importer** |
-| Blender 5.x | everything | mesh, textures, alpha, glow | no built-in COLLADA support (removed in 5.0). Third-party importer extensions vary |
-| Assimp-based tools, Noesis, 3ds Max, ... | – | mesh, textures, alpha | mesh, skeleton, animation, diffuse + emission + opacity textures |
+| | .blend | .glb | .obj | .dae |
+|---|---|---|---|---|
+| Blender 4.5 / 5.x | everything | everything in the .glb (File › Import › glTF). Each animation becomes an action; mesh visibility is the `hidden` shape key | mesh, textures, alpha, glow | 4.5: mesh & textures. **Alpha is ignored and bone animation is misread by Blender's COLLADA importer**. 5.x: no built-in COLLADA support |
+| glTF viewers and engines (three.js-based web viewers such as gltf-viewer.donmccurdy.com, the Babylon.js sandbox, Godot, ...) | – | everything in the .glb | – | – |
+| Assimp-based tools, Noesis, 3ds Max, ... | – | mesh, skeleton, animation, textures (morph-target support varies) | mesh, textures, alpha | mesh, skeleton, animation, diffuse + emission + opacity textures |
 
 Blender's built-in COLLADA importer was unmaintained for years and removed in Blender 5.0. Its
 shortcomings show up on *any* skinned, matrix-animated COLLADA file, not just these. To check a
-`.dae`, use an Assimp-based viewer or Noesis; to work in Blender, use the `.blend`.
+`.dae`, use an Assimp-based viewer or Noesis; to work in Blender, use the `.blend` or the `.glb`.
 
 ## Things to verify on the first run
 
@@ -379,6 +411,8 @@ If something fails, the useful bits to send back are `_containers.tsv`, the firs
 sc2rip.py           main script (run this)
 blender_convert.py  runs inside Blender: M3 import, animation merge, COLLADA/OBJ export, .blend
 sc2_material.py     runs inside Blender: export materials and the SC2-style .blend materials
+glb_export.py       runs inside Blender: the .glb (meshes, skin, animations, visibility, materials)
+gltf_writer.py      plain-Python glTF 2.0 binary writer used by glb_export.py
 casc.py             CASC (CascLib) and extracted-folder readers
 tools/casclib/      CascLib builds (MIT licence)
 tools/m3studio/     M3Studio add-on by Solstice245, unmodified (GPL-2.0-or-later)

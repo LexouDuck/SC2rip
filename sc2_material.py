@@ -375,6 +375,8 @@ def export_plan(layers, m3mat, mtype):
                 plan['emissive_layer'] = el
                 break
     plan['hdr_emis'] = float(getattr(m3mat, 'hdr_emis', 1.0) or 1.0)
+    plan['double_sided'] = bool(getattr(m3mat, 'two_sided', False))
+    plan['alpha_cutoff'] = (getattr(m3mat, 'alpha_test_threshold', 0) or 128) / 255.0
     blend = getattr(m3mat, 'blend_mode', 'OPAQUE')
     if blend in ('ADD', 'ALPHAA'):
         plan['alpha'] = 'additive'           # adds light: black = see-through
@@ -409,6 +411,18 @@ def layer_ops(layer, peaks=None):
     return {'channels': layer.color_channels, 'invert': bool(layer.color_invert),
             'scale': get('color_brightness') * get('color_multiply'), 'add': get('color_add'),
             'clamp': bool(layer.color_clamp), 'fresnel': f, 'post': 1.0}
+
+
+def _srgb_to_linear(x):
+    import numpy as np
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4)
+
+
+def _linear_to_srgb(x):
+    import numpy as np
+    x = np.clip(x, 0.0, 1.0)
+    return np.where(x <= 0.0031308, x * 12.92, 1.055 * x ** (1 / 2.4) - 0.055)
 
 
 def ops_identity(ops):
@@ -451,7 +465,12 @@ def derive_texture(out_path, main_img, main_ops, alpha_mode, alpha_img=None, alp
     px = _pixels(main_img)
     rgb = _apply_ops(_select(px, main_ops['channels']), main_ops)
     if alpha_mode == 'additive':
-        a = rgb.max(axis=2)
+        # straight alpha that reproduces the added light over black: alpha = brightest channel
+        # (linear), colour = light / alpha, so viewers blending in linear space get colour x alpha
+        # = the original light
+        lin = _srgb_to_linear(rgb)
+        a = lin.max(axis=2)
+        rgb = _linear_to_srgb(lin / np.maximum(a, 1e-6)[..., None])
     elif alpha_mode == 'mask':
         src = _pixels(alpha_img)
         if src.shape[:2] != px.shape[:2]:
@@ -479,7 +498,12 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
                           peaks=None):
     """Principled material for Blender's COLLADA/OBJ exporters. Returns (material, info) where info
     tells postprocess_dae what Blender's exporter can't write ({'alpha': bool, 'glow': bool})."""
-    info = {'alpha': False, 'glow': False, 'emission_node': None, 'emission_file': None}
+    info = {'alpha': False, 'glow': False, 'emission_node': None, 'emission_file': None,
+            # for the glTF export
+            'transparent': plan['transparent'], 'const_color': plan['const_color'],
+            'double_sided': plan.get('double_sided', False), 'alpha_cutoff': plan.get('alpha_cutoff', 0.5),
+            'base_image': None, 'alpha_kind': None, 'unlit': False, 'emission_image': None,
+            'normal_image': None}
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
     nt = mat.node_tree
@@ -546,6 +570,9 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
             report.setdefault('warnings', []).append(f'{name}: derived texture failed: {e!r}')
             use_img, has_alpha = img, False
 
+    info['base_image'] = use_img
+    info['alpha_kind'] = plan['alpha'] if has_alpha else None
+    info['unlit'] = bool(plan['glow'])
     tex = nt.nodes.new('ShaderNodeTexImage')
     tex.image = use_img
     tex.location = (-600, 300)
@@ -580,6 +607,7 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
                         derive_texture(path, eimg, eops, None)
                         _DERIVED[sig] = path
                     use_e = load_image(path)
+                info['emission_image'] = use_e
                 enode = nt.nodes.new('ShaderNodeTexImage')
                 enode.image = use_e
                 enode.location = (-600, -300)
@@ -589,10 +617,10 @@ def build_export_material(name, plan, tex_map, report, out_dir, normal_layer=Non
                 report.setdefault('warnings', []).append(f'{name}: emission texture failed: {e!r}')
         else:
             report['missing_textures'].add(layer_bitmap(el))
-    if normal_mode == 'rgb' and normal_layer is not None and layer_bitmap(normal_layer) \
-            and same_mapping(normal_layer, main):
+    if normal_layer is not None and layer_bitmap(normal_layer) and same_mapping(normal_layer, main):
         nimg = load_image(tex_map.get(norm_tex_key(layer_bitmap(normal_layer))), non_color=True)
-        if nimg is not None:
+        info['normal_image'] = nimg
+        if nimg is not None and normal_mode == 'rgb':
             ntex = nt.nodes.new('ShaderNodeTexImage')
             ntex.image = nimg
             nmap = nt.nodes.new('ShaderNodeNormalMap')

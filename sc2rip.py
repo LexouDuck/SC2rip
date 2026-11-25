@@ -35,7 +35,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
 
-CONVERTER_VERSION = '7'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '8'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -554,6 +554,7 @@ def main():
     out.add_argument('--save-blend', action='store_true',
                      help='also save a ready-to-view .blend next to each .dae')
     out.add_argument('--no-obj', action='store_true', help="don't write .obj/.mtl files next to the .dae files")
+    out.add_argument('--no-glb', action='store_true', help="don't write .glb (glTF binary) files next to the .dae files")
     out.add_argument('--keep-empty', action='store_true', help='export models that have no geometry')
     out.add_argument('--terrain-texture', default='auto', metavar='ID|PATH|auto|none',
                      help='stand-in for the map terrain shown by terrain materials (the ground around '
@@ -859,7 +860,7 @@ def main():
     # ---- 4. convert
     options = {'anim_mode': args.anim_mode, 'sampling_rate': args.anim_sampling,
                'save_blend': args.save_blend, 'skip_empty': not args.keep_empty, 'animations': True,
-               'obj': not args.no_obj, 'normal_maps': args.normal_maps,
+               'obj': not args.no_obj, 'glb': not args.no_glb, 'normal_maps': args.normal_maps,
                'converter_version': CONVERTER_VERSION, 'blender_version': bl_version}
 
     def expected_outputs(m):
@@ -867,6 +868,8 @@ def main():
         outs = [m['dae']]
         if options['obj']:
             outs += [base + '.obj', base + '.mtl']
+        if options['glb']:
+            outs.append(base + '.glb')
         if options['save_blend']:
             outs.append(base + '.blend')
         return outs
