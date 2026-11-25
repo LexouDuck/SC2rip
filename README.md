@@ -43,14 +43,25 @@ data of individual campaign maps). sc2rip reads all of it and files each model a
 |---|---|
 | `Melee` | used by the melee data (`core`, `liberty`, `swarm`, `void` and their `*multi` mods) |
 | `Campaign - <campaign>` | not used by the melee data, but by a campaign (the earliest one if several: Wings of Liberty, then its story mode, Heart of the Swarm, ...) |
-| `Co-op` | used only by Co-op Commanders data |
-| `Other - <mod>` | used only by some other mod |
+| `Co-op` | used only by Co-op Commanders data (`mods/starcoop/...`) |
+| `Other - <mod>` | used only by some other mod, e.g. `Other - Warcraft III` for Blizzard's Warcraft III arcade mods (`war3`, `war3data`, `warcoop/...`) |
 | `Unused` | not used by any game data: cut content, test models, or models only named in map scripts |
+
+Models stored in a mod other than the melee ones (such as the Warcraft III asset mod) that no data
+uses stay with that mod rather than going to `Unused`.
+
+Most `CModel` entries don't spell out their file: they inherit a template path such as
+`Assets\Units\##race##\##id##\##id##.m3` from a parent entry, with the entry's own attributes and
+`<?token?>` defaults filling in the `##...##` tokens. sc2rip expands these. A model counts as used
+when the data names its file (`path`), or names it without a variation / physics-part suffix
+(`variant`: the game picks `x_00.m3`, `x_01.m3`... for a model `x.m3` with variations, and
+`x_prtmdl_*.m3` are parts of `x.m3`), or has a `CModel` whose id is the file's name (`id`).
+Failing all of those, a file inherits from the other files in its folder (`folder`).
 
 A unit's folder is never split: if its main model is melee, its campaign-only portrait or variant
 goes with it. `_plan.tsv` lists, for every model, where it's filed (`filed_as`), where it's stored
-(`stored_in`) and which mods/campaigns use it (`used_by`). Reading the game data takes a while the
-first time; the result is cached in `_work/model_refs.json`.
+(`stored_in`), which mods/campaigns use it (`used_by`) and how that was found (`found_by`). Reading
+the game data takes a while the first time; the result is cached in `_work/model_refs.json`.
 
 `--sources` picks which of these to rip (default `melee,campaign,unused`; add `coop`, `other`).
 `--classify location` goes back to sorting by where the files are stored. sc2rip also does that

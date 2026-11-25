@@ -34,6 +34,7 @@ import zipfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import casc  # noqa: E402
+import game_data  # noqa: E402
 import team_colors  # noqa: E402
 
 CONVERTER_VERSION = '8'  # bump when output changes, so cached folders are redone
@@ -54,19 +55,25 @@ CONTAINER_RULES = [
     (r'mods/libertymulti\.sc2mod', 'melee', 'Wings of Liberty Multiplayer', 4),
     (r'mods/swarmmulti\.sc2mod', 'melee', 'Heart of the Swarm Multiplayer', 5),
     (r'mods/voidmulti\.sc2mod', 'melee', 'Legacy of the Void Multiplayer', 6),
+    (r'mods/balancemulti[^/]*\.sc2mod', 'melee', 'Multiplayer balance', 7),
     (r'campaigns/liberty\.sc2campaign', 'campaign', 'Wings of Liberty', None),
     (r'campaigns/libertystory\.sc2campaign', 'campaign', 'Wings of Liberty (Story)', None),
     (r'campaigns/swarm\.sc2campaign', 'campaign', 'Heart of the Swarm', None),
-    (r'campaigns/swarmstory\.sc2campaign', 'campaign', 'Heart of the Swarm (Story)', None),
-    (r'campaigns/voidprologue\.sc2campaign', 'campaign', 'Whispers of Oblivion', None),
+    (r'campaigns/swarmstory[^/]*\.(sc2campaign|sc2mod)', 'campaign', 'Heart of the Swarm (Story)', None),
+    (r'(campaigns|mods)/voidprologue\.(sc2campaign|sc2mod)', 'campaign', 'Whispers of Oblivion', None),
     (r'campaigns/voidprologuestory\.sc2campaign', 'campaign', 'Whispers of Oblivion (Story)', None),
     (r'campaigns/void\.sc2campaign', 'campaign', 'Legacy of the Void', None),
     (r'campaigns/voidstory\.sc2campaign', 'campaign', 'Legacy of the Void (Story)', None),
     (r'campaigns/voidepilogue\.sc2campaign', 'campaign', 'Legacy of the Void Epilogue', None),
     (r'mods/novacampaign\.sc2mod', 'campaign', 'Nova Covert Ops', None),
-    (r'mods/novastory\.sc2mod', 'campaign', 'Nova Covert Ops (Story)', None),
+    (r'mods/novastory[^/]*\.sc2mod', 'campaign', 'Nova Covert Ops (Story)', None),
+    (r'mods/nova[^/]*\.sc2mod', 'campaign', 'Nova Covert Ops', None),
     (r'campaigns/[^/]+', 'campaign', None, None),
+    # co-op missions: mods/starcoop/starcoop.sc2mod, mods/starcoop/commanders/<commander>.sc2mod, ...
+    (r'mods/starcoop/.+', 'coop', 'Co-op', None),
     (r'mods/(alliedcommanders|coop[^/]*|[^/]*commander[^/]*)\.sc2mod', 'coop', 'Co-op', None),
+    # Blizzard's Warcraft III mods for the arcade (assets, data, and the Warcraft co-op/classic modes)
+    (r'mods/(war3|war3data)\.sc2mod|mods/warcoop/.+', 'other', 'Warcraft III', None),
 ]
 GROUP_ORDER = ['melee', 'campaign', 'coop', 'other', 'unused']
 
@@ -106,7 +113,7 @@ def safe(s):
 
 class ModelFile:
     __slots__ = ('path', 'lc', 'container', 'group', 'label', 'prio', 'cat', 'rel', 'ext',
-                 'out_group', 'out_label', 'refs')
+                 'out_group', 'out_label', 'refs', 'ref_how')
 
     def __init__(self, path, m):
         self.path = path
@@ -118,7 +125,7 @@ class ModelFile:
         self.ext = self.lc.rsplit('.', 1)[-1]
         # where the model is filed in the output: by default where it is stored, see classify_by_data()
         self.out_group, self.out_label = self.group, self.label
-        self.refs = None
+        self.refs, self.ref_how = None, ''
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
@@ -193,8 +200,18 @@ def resolve_texture(ref, textures, container, melee_order):
 #   Other     otherwise, used by another mod
 #   Unused    not referenced by any game data (cut content, or models only used by name in scripts)
 # A unit's folder is never split: the whole asset folder goes where its "best" model goes.
+#
+# Most CModel entries don't spell out their file: they inherit a template path such as
+# Assets\Units\##race##\##id##\##id##.m3 from a parent entry (see game_data.py). A model counts as
+# used by a mod when, in that mod's data:
+#   path     a CModel entry (or any other field) names the file, templates expanded
+#   variant  it names the file without its variation / part suffix: SC2 picks x_00.m3, x_01.m3 ...
+#            for a model x.m3 with variations, and x_prtmdl_*.m3 are the parts of x.m3's physics
+#   id       a CModel entry's id is the file's name (in case a template wasn't understood)
+#   folder   (only if none of the above) another file in the same folder is used
 
 MODELREF_RE = re.compile(rb'["\'>]\s*([^"\'<>\r\n]{1,260}?\.m3)\s*["\'<]', re.I)
+MODEL_REFS_VERSION = 2
 
 
 def data_owner(path_lc):
@@ -205,17 +222,32 @@ def data_owner(path_lc):
     return path_lc.split('/', 1)[0]
 
 
+def base_data_containers():
+    """Containers whose data every other mod builds on: the melee mods, in load order."""
+    rules = sorted((prio, rx) for rx, group, _label, prio in CONTAINER_RULES
+                   if group == 'melee' and prio is not None and re.fullmatch(r'[\w/]+\\\.sc2mod', rx))
+    return [rx.replace('\\.', '.') for _, rx in rules]
+
+
+def _ref_key(value):
+    k = value.replace('\\', '/').strip().lower()
+    j = k.find('assets/')
+    return k[j:] if j >= 0 and k.endswith('.m3') else None
+
+
 def load_model_refs(storage, xml_paths, cache_path, log):
-    """{'assets/units/.../x.m3': {data containers that reference it}} from every game data .xml."""
-    sig = hashlib.sha1('\n'.join(sorted(p.lower() for p in xml_paths)).encode()).hexdigest()
+    """-> {'paths': {'assets/units/.../x.m3': {data containers}}, 'ids': {cmodel id: {containers}}}
+    from every game data .xml (see above)."""
+    sig = hashlib.sha1(('v%d\n' % MODEL_REFS_VERSION + '\n'.join(sorted(p.lower() for p in xml_paths)))
+                       .encode()).hexdigest()
     try:
         with open(cache_path, encoding='utf-8') as f:
             cached = json.load(f)
         if cached.get('sig') == sig:
-            return {k: set(v) for k, v in cached['refs'].items()}
-    except (OSError, ValueError, KeyError):
+            return {k: {kk: set(vv) for kk, vv in cached[k].items()} for k in ('paths', 'ids')}
+    except (OSError, ValueError, KeyError, AttributeError):
         pass
-    refs, failed = {}, 0
+    paths, ids, entries, failed, bad_xml = {}, {}, [], 0, 0
     t0 = time.time()
     for i, p in enumerate(sorted(xml_paths)):
         if i and i % 500 == 0:
@@ -226,19 +258,38 @@ def load_model_refs(storage, xml_paths, cache_path, log):
             failed += 1
             continue
         owner = data_owner(p.lower())
+        # explicit paths anywhere (actors, effects ...)
         for r in MODELREF_RE.findall(data):
-            k = r.decode('latin-1').replace('\\', '/').strip().lower()
-            j = k.find('assets/')
-            if j >= 0:
-                refs.setdefault(k[j:], set()).add(owner)
+            k = _ref_key(r.decode('latin-1'))
+            if k:
+                paths.setdefault(k, set()).add(owner)
+        # CModel entries, with their templates
+        if b'<CModel' in data:
+            try:
+                entries += game_data.parse_catalog(data, owner, ('CModel',),
+                                                   lambda v: '.m3' in v.lower() or '##' in v)
+            except ET.ParseError:
+                bad_xml += 1
+    cat = game_data.Catalog(entries, base_data_containers())
+    n_tpl = 0
+    for tag, eid, owner in cat.concrete():
+        ids.setdefault(eid.lower(), set()).add(owner)
+        for _field, v in cat.values(tag, eid, owner):
+            k = _ref_key(v)
+            if k:
+                if owner not in paths.get(k, ()):
+                    n_tpl += 1
+                paths.setdefault(k, set()).add(owner)
     log(f'  read {len(xml_paths) - failed} game data files in {time.time() - t0:.0f}s'
-        + (f' ({failed} unreadable)' if failed else '') + f': {len(refs)} model paths referenced')
+        + (f' ({failed} unreadable)' if failed else '') + (f' ({bad_xml} not valid XML)' if bad_xml else '')
+        + f': {len(paths)} model paths referenced ({n_tpl} through templates), {len(ids)} CModel ids')
+    res = {'paths': paths, 'ids': ids}
     try:
         with open(cache_path, 'w', encoding='utf-8') as f:
-            json.dump({'sig': sig, 'refs': {k: sorted(v) for k, v in refs.items()}}, f)
+            json.dump({'sig': sig, **{k: {kk: sorted(vv) for kk, vv in v.items()} for k, v in res.items()}}, f)
     except OSError:
         pass
-    return refs
+    return res
 
 
 def _rule_index(container_lc):
@@ -261,12 +312,63 @@ def data_class(containers):
     return group, label, _data_rank(best)
 
 
+VARIANT_RE = re.compile(r'(?:_prtmdl.*|_\d+)$')
+
+
+def model_base_names(stem):
+    """'thor_silver_death_00_prtmdl_rib1' -> ['thor_silver_death_00', 'thor_silver_death']"""
+    out = []
+    while True:
+        s = VARIANT_RE.sub('', stem)
+        if not s or s == stem:
+            return out
+        out.append(s)
+        stem = s
+
+
+def model_usage(m, refs, dir_refs):
+    """-> (data containers using model m, how that was found)"""
+    paths, ids = refs['paths'], refs['ids']
+    folder, name = m.rel.lower().rsplit('/', 1) if '/' in m.rel else ('', m.rel.lower())
+    stem = os.path.splitext(name)[0]
+    prefix = f'assets/{m.cat}/' + (folder + '/' if folder else '')
+    used, how = set(), []
+    if prefix + name in paths:
+        used |= paths[prefix + name]
+        how.append('path')
+    for base in model_base_names(stem):
+        if prefix + base + '.m3' in paths:
+            used |= paths[prefix + base + '.m3']
+            how.append('variant')
+            break
+    for s in [stem] + model_base_names(stem):
+        if s in ids:
+            new = ids[s] - used
+            if new:
+                used |= new
+                how.append('id')
+            break
+    if not used and folder and prefix in dir_refs:
+        used = set(dir_refs[prefix])
+        how.append('folder')
+    return used, '+'.join(how)
+
+
 def classify_by_data(models, refs, log):
-    """Set out_group / out_label / refs of every model from the game data that uses it."""
+    """Set out_group / out_label / refs / ref_how of every model from the game data that uses it.
+    Unused models stored outside the melee mods (e.g. the Warcraft III asset mod) stay filed where
+    they are stored."""
+    dir_refs = {}
+    for k, owners in refs['paths'].items():
+        dir_refs.setdefault(k.rsplit('/', 1)[0] + '/', set()).update(owners)
     rank = {}
     for m in models:
-        m.refs = sorted(refs.get(f'assets/{m.cat}/{m.rel.lower()}', ()))
-        m.out_group, m.out_label, rank[id(m)] = data_class(m.refs)
+        used, m.ref_how = model_usage(m, refs, dir_refs)
+        m.refs = sorted(used)
+        m.out_group, m.out_label, rank[id(m)] = data_class(used)
+        if not used and m.group not in ('melee', 'campaign'):
+            m.out_group, m.out_label = m.group, m.label
+            rank[id(m)] = (GROUP_ORDER.index(m.group), _rule_index(m.container.lower()), m.container.lower())
     # keep each asset folder together: all its files go where its best .m3 goes
     by_folder = {}
     for m in models:
@@ -275,12 +377,15 @@ def classify_by_data(models, refs, log):
         best = min((m for m in ms if m.ext == 'm3'), default=ms[0], key=lambda m: rank[id(m)])
         for m in ms:
             m.out_group, m.out_label = best.out_group, best.out_label
-    counts = {}
+    counts, hows = {}, {}
     for m in models:
         if m.ext == 'm3':
             counts[(m.out_group, m.out_label)] = counts.get((m.out_group, m.out_label), 0) + 1
+            h = m.ref_how or 'none'
+            hows[h] = hows.get(h, 0) + 1
     for (g, l), n in sorted(counts.items(), key=lambda kv: (GROUP_ORDER.index(kv[0][0]), kv[0][1])):
         log(f'  {g:8s} {l:40s} {n:5d} .m3 files')
+    log('  found by: ' + ', '.join(f'{h} {n}' for h, n in sorted(hows.items(), key=lambda kv: -kv[1])))
 
 
 def asset_folder_key(m):
@@ -308,39 +413,34 @@ def m3_has_terrain_material(data):
 
 
 def load_terrain_catalogue(storage, paths, melee_order, log):
-    """{id: {'id', 'diffuse', 'normal', 'container'}} from every TerrainTexData.xml. Melee mods are
-    read last, in their override order, so their definitions win."""
-    rank = {c: i for i, c in enumerate(melee_order)}
-    paths = sorted(paths, key=lambda p: (container_of(p.lower()) in rank,
-                                         rank.get(container_of(p.lower()), 0), p.lower()))
-    raw = {}
+    """{id: {'id', 'diffuse', 'normal', 'container'}} from every TerrainTexData.xml, templates
+    expanded (see game_data.py). An id defined by several mods is taken from a melee mod if it can
+    be (the newest one), otherwise from the first other mod."""
+    entries = []
     for path in paths:
         try:
-            root = ET.fromstring(storage.read(path))
+            entries += game_data.parse_catalog(storage.read(path), container_of(path.lower()), ('CTerrainTex',))
         except Exception as e:
             log(f'  ! cannot read {path}: {e}')
-            continue
-        for el in root.iter():
-            if el.tag != 'CTerrainTex' or not el.get('id'):
-                continue
-            e = raw.setdefault(el.get('id'), {'id': el.get('id'), 'container': container_of(path.lower())})
-            if el.get('parent'):
-                e['parent'] = el.get('parent')
-            for child in el:
-                tag, val = child.tag.lower(), (child.get('value') or '').strip()
-                if val and tag == 'texture':
-                    e['diffuse'] = val
-                elif val and tag == 'normalmap':
-                    e['normal'] = val
-    for e in raw.values():          # inherit texture fields from parent entries
-        p, seen = e.get('parent'), set()
-        while p and p in raw and p not in seen:
-            seen.add(p)
-            for k in ('diffuse', 'normal'):
-                if k not in e and k in raw[p]:
-                    e[k] = raw[p][k]
-            p = raw[p].get('parent')
-    return {k: v for k, v in raw.items() if v.get('diffuse')}
+    cat = game_data.Catalog(entries, base_data_containers())
+    rank = {c: i for i, c in enumerate(melee_order)}
+    best = {}
+    for tag, eid, container in cat.concrete():
+        key = (container not in rank, -rank.get(container, 0), container)
+        if eid not in best or key < best[eid][0]:
+            best[eid] = (key, container)
+    out = {}
+    for eid, (_key, container) in best.items():
+        vals = cat.values('CTerrainTex', eid, container)
+        e = {'id': eid, 'container': container}
+        for field, v in vals:
+            if field == 'texture' and 'diffuse' not in e:
+                e['diffuse'] = v
+            elif field == 'normalmap' and 'normal' not in e:
+                e['normal'] = v
+        if e.get('diffuse'):
+            out[eid] = e
+    return out
 
 
 TERRAIN_KEYWORDS = ('dirt', 'soil', 'sand', 'ground', 'gravel', 'ash', 'rock')
@@ -762,7 +862,7 @@ def main():
         log('Sorting models by the game data that uses them ...')
         os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)
         refs = load_model_refs(storage, game_data, os.path.join(args.out, '_work', 'model_refs.json'), log)
-        if refs:
+        if refs['paths'] or refs['ids']:
             classify_by_data(models, refs, log)
         else:
             log('  ! no model references found in the game data: sorting by storage location instead')
@@ -787,11 +887,11 @@ def main():
 
     with open(os.path.join(args.out, '_plan.tsv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f, delimiter='\t', lineterminator='\n')
-        w.writerow(['output_folder', 'storage_path', 'filed_as', 'stored_in', 'used_by'])
+        w.writerow(['output_folder', 'storage_path', 'filed_as', 'stored_in', 'used_by', 'found_by'])
         for k, ms in folders.items():
             for m in ms:
                 w.writerow([k, m.path, m.out_group, m.container,
-                            ' '.join(m.refs) if m.refs is not None else '(not checked)'])
+                            ' '.join(m.refs) if m.refs is not None else '(not checked)', m.ref_how])
     n_m3 = sum(1 for ms in folders.values() for m in ms if m.ext == 'm3')
     log(f'Plan: {len(folders)} output folders, {n_m3} .m3 models (see _plan.tsv)')
 
