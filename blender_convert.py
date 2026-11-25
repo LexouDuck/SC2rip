@@ -1032,12 +1032,29 @@ def convert_model(m3s, model, tex_map, opts):
     report['warnings'].extend(importer.warn_strings)
     ob = importer.ob
 
+    model_stem = os.path.splitext(os.path.basename(model['m3']))[0].lower()
     for m3a in model.get('m3a', []) if get_anims else []:
         try:
+            before = len(ob.m3_animation_groups)
+            existing = {(g.name or '').strip().lower() for g in ob.m3_animation_groups}
             imp2 = io_imp.Importer()
             imp2.m3a_import(m3a, ob)
             report['warnings'].extend(imp2.warn_strings)
             report.setdefault('m3a_imported', []).append(os.path.basename(m3a))
+            # an animation library may redefine sequences the model has ("Stand", "Walk"...): name
+            # its versions after the library, e.g. "Stand (swarmanims)"
+            tag = os.path.splitext(os.path.basename(m3a))[0]
+            if tag.lower().startswith(model_stem):
+                tag = tag[len(model_stem):].strip('_ ') or tag
+            try:   # M3Studio makes clashing names unique ("Stand 01"): use the file's own names
+                names = [imp2.m3[s.name].content_to_string() for s in imp2.m3[imp2.m3_model.sequences]]
+            except Exception:
+                names = []
+            added = list(ob.m3_animation_groups)[before:]
+            for i, g in enumerate(added):
+                orig = (names[i] if len(names) == len(added) else g.name or '').strip()
+                if orig.lower() in existing:
+                    g.name = f'{orig} ({tag})'
         except Exception as e:
             report['warnings'].append(f'm3a import failed for {os.path.basename(m3a)}: {e!r}')
 

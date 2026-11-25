@@ -37,7 +37,7 @@ import casc  # noqa: E402
 import game_data  # noqa: E402
 import team_colors  # noqa: E402
 
-CONVERTER_VERSION = '8'  # bump when output changes, so cached folders are redone
+CONVERTER_VERSION = '9'  # bump when output changes, so cached folders are redone
 M3STUDIO_COMMIT = 'bef1b08136d73d6b530d07068dbb510aeba4c6db'  # version sc2rip was tested with
 M3STUDIO_URL = 'https://github.com/Solstice245/m3studio/archive/{ref}.zip'
 
@@ -126,7 +126,7 @@ class ModelFile:
         # where the model is filed in the output: by default where it is stored, see classify_by_data()
         self.out_group, self.out_label = self.group, self.label
         self.refs, self.ref_how = None, ''
-        self.nest = None    # (parent folder name, subfolder): see nest_death_folders()
+        self.nest = None    # (parent folder name, subfolder): see nest_unit_folders()
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
@@ -393,7 +393,7 @@ def classify_by_data(models, refs, log):
 
 def asset_folder_key(m):
     """The unit a model file belongs to: (category, race, unit folder). Death models nested under
-    a unit (see nest_death_folders) belong to that unit."""
+    a unit (see nest_unit_folders) belong to that unit."""
     parts = m.rel.lower().split('/')
     if m.nest:
         return (m.cat, parts[0], m.nest[0].lower())
@@ -405,38 +405,48 @@ def asset_folder_key(m):
 # subfolder of that unit, named without the unit's name: Units/Melee/Terran/Marine/deathacid.
 # The unit is the longest other folder of the same race whose name starts the death folder's name,
 # with at most one of these unit states in between (BarracksFlyDeath -> Barracks/flydeath).
+#
+# Extra animation libraries (.m3a files with no model: Marine_SwarmAnims, ArchonOptionalAnims,
+# Marine_BlackOps_DLC2Anims...) go into the folder of the unit they animate (the longest folder of
+# the same race with a model whose name starts theirs), and are added to its model's animations.
 DEATH_STATES = ('', 'empty', 'fly', 'morph', 'unpowered', 'detached', 'open', 'lowered', 'sieged',
                 'unburrowed', 'burrow', 'burrowed', 'phasing', 'hive', 'lair', 'yamato', 'warpgate',
                 'acid', 'fire', 'walk', 'physics', 'construction')
 
 
-def nest_death_folders(models):
-    """Set m.nest for the models of death folders that belong to another unit folder."""
-    folders = {}            # (cat, race) -> {lowercase folder: original-case folder}
+def nest_unit_folders(models, deaths=True, anims=True):
+    """Set m.nest = (unit folder, subfolder or None) for the files of death folders and animation
+    library folders that belong to another unit folder. -> (death folders, animation folders)"""
+    folders, exts = {}, {}      # (cat, race) -> {lowercase folder: original case}; folder -> {ext}
     for m in models:
         parts = m.rel.split('/')
         if len(parts) >= 3:
-            folders.setdefault((m.cat, parts[0].lower()), {}).setdefault(parts[1].lower(), parts[1])
-    nested = {}
+            key = (m.cat, parts[0].lower())
+            folders.setdefault(key, {}).setdefault(parts[1].lower(), parts[1])
+            exts.setdefault(key + (parts[1].lower(),), set()).add(m.ext)
+    nested, n_death, n_anim = {}, 0, 0
     for (cat, race), names in folders.items():
         for name in names:
             i = name.find('death')
-            if i <= 0:
-                continue
-            head = name[:i]
-            cands = [p for p in names if p != name and len(p) >= 3 and 'death' not in p and head.startswith(p)
-                     and head[len(p):].strip('_') in DEATH_STATES]
-            if cands:
-                parent = max(cands, key=len)
-                sub = name[len(parent):].strip('_')
-                nested[(cat, race, name)] = (names[parent], sub)
-    n = 0
+            if deaths and i > 0:
+                head = name[:i]
+                cands = [p for p in names if p != name and len(p) >= 3 and 'death' not in p
+                         and head.startswith(p) and head[len(p):].strip('_') in DEATH_STATES]
+                if cands:
+                    parent = max(cands, key=len)
+                    nested[(cat, race, name)] = (names[parent], name[len(parent):].strip('_'))
+                    n_death += 1
+            elif anims and exts[(cat, race, name)] == {'m3a'}:
+                cands = [p for p in names if p != name and len(p) >= 3 and name.startswith(p)
+                         and 'm3' in exts[(cat, race, p)]]
+                if cands:
+                    nested[(cat, race, name)] = (names[max(cands, key=len)], None)
+                    n_anim += 1
     for m in models:
         parts = m.rel.split('/')
         if len(parts) >= 3:
             m.nest = nested.get((m.cat, parts[0].lower(), parts[1].lower()))
-            n += m.nest is not None and m.ext == 'm3'
-    return len(nested), n
+    return n_death, n_anim
 
 
 # --------------------------------------------------------------------------------------
@@ -538,7 +548,9 @@ def folder_for(m):
     stem = os.path.splitext(parts[-1])[0]
     unit = pretty(parts[1], stem) if len(parts) >= 3 else pretty(stem)
     if m.nest:
-        unit = os.path.join(safe(pretty(m.nest[0], stem[:len(m.nest[0])])), safe(m.nest[1].lower()))
+        unit = safe(pretty(m.nest[0], stem[:len(m.nest[0])]))
+        if m.nest[1]:
+            unit = os.path.join(unit, safe(m.nest[1].lower()))
     cat = 'Units' if m.cat == 'units' else 'Buildings'
     group, label = m.out_group, m.out_label
     if group == 'melee':
@@ -811,6 +823,9 @@ def main():
     sel.add_argument('--flat-deaths', action='store_true',
                      help="keep death models in folders of their own (default: in a subfolder of their unit, "
                           "e.g. Units/Melee/Terran/Marine/deathacid)")
+    sel.add_argument('--no-extra-anims', action='store_true',
+                     help="don't add the animation libraries of other folders (Marine_SwarmAnims, "
+                          "Marine_BlackOps_DLC2Anims...) to their unit's model")
     sel.add_argument('--no-dedupe', action='store_true',
                      help='keep campaign/co-op models that are byte-identical to an already-ripped one')
     sel.add_argument('--limit', type=int, default=0, help='only process the first N folders (testing)')
@@ -909,9 +924,11 @@ def main():
             w.writerow([c, g, l, v['units'], v['buildings']])
             log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d}')
 
-    if not args.flat_deaths:
-        n_folders, n_m3 = nest_death_folders(models)
-        log(f'Death models: {n_folders} folders ({n_m3} .m3) go in a subfolder of their unit')
+    n_death, n_anim = nest_unit_folders(models, deaths=not args.flat_deaths, anims=not args.no_extra_anims)
+    if n_death:
+        log(f'Death models: {n_death} folders go in a subfolder of their unit')
+    if n_anim:
+        log(f'Animation libraries: {n_anim} folders of .m3a files go with the unit they animate')
     if args.classify == 'data':
         log('Sorting models by the game data that uses them ...')
         os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)
@@ -1089,6 +1106,10 @@ def main():
             owners = [m for m in m3s if astem.startswith(os.path.splitext(m.rel.split('/')[-1])[0].lower())]
             if owners:
                 m3a_owner[a.path] = max(owners, key=lambda m: len(m.rel.split('/')[-1]))
+            elif a.nest and m3s:    # a library from another folder: the unit's main model
+                main = [m for m in m3s if not m.nest and os.path.splitext(m.rel.split('/')[-1])[0].lower()
+                        == a.nest[0].lower()]
+                m3a_owner[a.path] = (main or sorted(m3s, key=lambda m: len(m.rel)))[0]
         for m in m3s:
             try:
                 data = storage.read(m.path)

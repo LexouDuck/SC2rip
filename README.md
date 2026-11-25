@@ -81,6 +81,15 @@ starts the death folder's name, possibly followed by a state (`fly`, `lowered`, 
 `unpowered`, `hive`...). Death folders of no unit (`ProtossBuildingDeathEx1`, the shared building
 deaths) stay where they are. `--flat-deaths` keeps every death folder at the top level.
 
+### Extra animation libraries
+
+Some folders hold only `.m3a` files: extra animations for a unit made for an expansion, a
+campaign or a skin (`Marine_SwarmAnims`, `ArchonOptionalAnims`, `Marine_BlackOps_DLC2Anims`...).
+sc2rip adds them to the model of the unit they animate (the longest folder of the same race with a
+model whose name starts theirs), so `Marine.glb` / `.dae` / `.blend` also hold the Marine's
+Heart of the Swarm animations. Where a library redefines an animation the model has, its version
+is named after the library: `Stand (SwarmAnims)`. `--no-extra-anims` leaves them out.
+
 `--sources` picks which of these to rip (default `melee,campaign,unused`; add `coop`, `other`).
 `--classify location` goes back to sorting by where the files are stored. sc2rip also does that
 when it finds no model references in the game data.
