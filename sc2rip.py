@@ -4,7 +4,7 @@ sc2rip - batch-rip StarCraft II unit & building models to COLLADA (.dae) + PNG t
 
 Pipeline
   1. read the game's CASC storage (CascLib) or an already-extracted copy of the files
-  2. pick every .m3/.m3a under Assets/Units and Assets/Buildings of the selected mods/campaigns
+  2. pick every .m3/.m3a under Assets/Units, Assets/Buildings and Assets/Portraits of the selected mods/campaigns
      (melee = standard multiplayer data, campaign = WoL/HotS/LotV/NCO campaigns), skipping
      campaign copies that are byte-identical to the standard ones
   3. extract them plus every texture they reference, convert DDS -> PNG
@@ -78,7 +78,7 @@ CONTAINER_RULES = [
 GROUP_ORDER = ['melee', 'campaign', 'coop', 'other', 'unused']
 
 ASSET_RE = re.compile(
-    r'^(?P<container>.+?)/(?:(?P<pkg>[^/]+\.sc2assets)/)?assets/(?P<cat>units|buildings)/(?P<rel>.+)$')
+    r'^(?P<container>.+?)/(?:(?P<pkg>[^/]+\.sc2assets)/)?assets/(?P<cat>units|buildings|portraits)/(?P<rel>.+)$')
 TEXREF_RE = re.compile(rb'([A-Za-z0-9_\-\\/ .()]{3,260}?\.(?:dds|tga|png|jpg))\x00', re.I)
 
 
@@ -126,7 +126,7 @@ class ModelFile:
         # where the model is filed in the output: by default where it is stored, see classify_by_data()
         self.out_group, self.out_label = self.group, self.label
         self.refs, self.ref_how = None, ''
-        self.nest = None    # (parent folder name, subfolder): see nest_unit_folders()
+        self.nest = None    # (unit folder, subfolder or None, unit category): see nest_unit_folders()
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
@@ -396,7 +396,7 @@ def asset_folder_key(m):
     a unit (see nest_unit_folders) belong to that unit."""
     parts = m.rel.lower().split('/')
     if m.nest:
-        return (m.cat, parts[0], m.nest[0].lower())
+        return (m.nest[2], parts[0], m.nest[0].lower())
     return (m.cat, parts[0], parts[1] if len(parts) >= 3 else os.path.splitext(parts[-1])[0])
 
 
@@ -414,9 +414,13 @@ DEATH_STATES = ('', 'empty', 'fly', 'morph', 'unpowered', 'detached', 'open', 'l
                 'acid', 'fire', 'walk', 'physics', 'construction')
 
 
-def nest_unit_folders(models, deaths=True, anims=True):
-    """Set m.nest = (unit folder, subfolder or None) for the files of death folders and animation
-    library folders that belong to another unit folder. -> (death folders, animation folders)"""
+PORTRAIT_RE = re.compile(r'_?portrait', re.I)
+
+
+def nest_unit_folders(models, deaths=True, anims=True, portraits=True):
+    """Set m.nest = (unit folder, subfolder or None, unit category) for the files of death folders,
+    animation library folders and portrait folders that belong to a unit folder.
+    -> (death folders, animation folders, portrait folders)"""
     folders, exts = {}, {}      # (cat, race) -> {lowercase folder: original case}; folder -> {ext}
     for m in models:
         parts = m.rel.split('/')
@@ -424,29 +428,45 @@ def nest_unit_folders(models, deaths=True, anims=True):
             key = (m.cat, parts[0].lower())
             folders.setdefault(key, {}).setdefault(parts[1].lower(), parts[1])
             exts.setdefault(key + (parts[1].lower(),), set()).add(m.ext)
-    nested, n_death, n_anim = {}, 0, 0
+    nested, n_death, n_anim, n_portrait = {}, 0, 0, 0
     for (cat, race), names in folders.items():
         for name in names:
             i = name.find('death')
-            if deaths and i > 0:
+            if portraits and 'portrait' in name or cat == 'portraits':
+                # portraits: Assets/Portraits/<race>/<name>, or a *Portrait folder among the units
+                # -> the unit (or building) folder of the same race named like it without "portrait"
+                if not portraits or 'm3' not in exts[(cat, race, name)]:
+                    continue
+                unit = PORTRAIT_RE.sub('', name).strip('_')
+                for ucat in ('units', 'buildings'):
+                    unames = folders.get((ucat, race), {})
+                    if unit in unames and (ucat, race, unit) != (cat, race, name) \
+                            and 'm3' in exts[(ucat, race, unit)]:
+                        sub = name[len(unit):].strip('_') if name.startswith(unit) else ''
+                        if 'portrait' not in sub:
+                            sub = 'portrait' + ('_' + sub if sub else '')
+                        nested[(cat, race, name)] = (unames[unit], sub, ucat)
+                        n_portrait += 1
+                        break
+            elif deaths and i > 0:
                 head = name[:i]
                 cands = [p for p in names if p != name and len(p) >= 3 and 'death' not in p
                          and head.startswith(p) and head[len(p):].strip('_') in DEATH_STATES]
                 if cands:
                     parent = max(cands, key=len)
-                    nested[(cat, race, name)] = (names[parent], name[len(parent):].strip('_'))
+                    nested[(cat, race, name)] = (names[parent], name[len(parent):].strip('_'), cat)
                     n_death += 1
             elif anims and exts[(cat, race, name)] == {'m3a'}:
                 cands = [p for p in names if p != name and len(p) >= 3 and name.startswith(p)
                          and 'm3' in exts[(cat, race, p)]]
                 if cands:
-                    nested[(cat, race, name)] = (names[max(cands, key=len)], None)
+                    nested[(cat, race, name)] = (names[max(cands, key=len)], None, cat)
                     n_anim += 1
     for m in models:
         parts = m.rel.split('/')
         if len(parts) >= 3:
             m.nest = nested.get((m.cat, parts[0].lower(), parts[1].lower()))
-    return n_death, n_anim
+    return n_death, n_anim, n_portrait
 
 
 # --------------------------------------------------------------------------------------
@@ -551,7 +571,7 @@ def folder_for(m):
         unit = safe(pretty(m.nest[0], stem[:len(m.nest[0])]))
         if m.nest[1]:
             unit = os.path.join(unit, safe(m.nest[1].lower()))
-    cat = 'Units' if m.cat == 'units' else 'Buildings'
+    cat = {'units': 'Units', 'buildings': 'Buildings', 'portraits': 'Portraits'}[m.nest[2] if m.nest else m.cat]
     group, label = m.out_group, m.out_label
     if group == 'melee':
         grp = 'Melee'
@@ -783,8 +803,8 @@ def find_files(args):
             m = ASSET_RE.match(p.lower())
             note = ''
             if p.lower().endswith(('.m3', '.m3a')):
-                if not m or m.group('cat') not in ('units', 'buildings'):
-                    note = 'not under Assets/Units or Assets/Buildings'
+                if not m:
+                    note = 'not under Assets/Units, Assets/Buildings or Assets/Portraits'
                 elif m.group('pkg') not in (None, 'base.sc2assets'):
                     note = f'localized package {m.group("pkg")} (ignored)'
             rows.append((p, c, group, note))
@@ -807,8 +827,8 @@ def main():
                      help='use files already extracted from the game (e.g. with CascView) instead of CASC')
     src.add_argument('--casclib', help='path to the CascLib shared library (default: tools/casclib/)')
     sel = ap.add_argument_group('selection')
-    sel.add_argument('--categories', default='units,buildings',
-                     help='comma list: units,buildings (default: both)')
+    sel.add_argument('--categories', default='units,buildings,portraits',
+                     help='comma list: units,buildings,portraits (default: all three)')
     sel.add_argument('--sources', default='melee,campaign,unused',
                      help='comma list of melee,campaign,coop,other,unused: which models to rip, by what uses '
                           'them (see --classify; default: melee,campaign,unused)')
@@ -823,6 +843,9 @@ def main():
     sel.add_argument('--flat-deaths', action='store_true',
                      help="keep death models in folders of their own (default: in a subfolder of their unit, "
                           "e.g. Units/Melee/Terran/Marine/deathacid)")
+    sel.add_argument('--flat-portraits', action='store_true',
+                     help='keep portrait models in Portraits/... folders of their own (default: in a subfolder '
+                          'of their unit, e.g. Units/Melee/Terran/Marine/portrait)')
     sel.add_argument('--no-extra-anims', action='store_true',
                      help="don't add the animation libraries of other folders (Marine_SwarmAnims, "
                           "Marine_BlackOps_DLC2Anims...) to their unit's model")
@@ -909,26 +932,33 @@ def main():
     log(f'Reading {storage.describe()}')
     t0 = time.time()
     models, textures, terrain_data, game_data = scan(storage, args.categories)
-    log(f'{len(storage.files())} files in storage, {len(models)} unit/building model files '
+    log(f'{len(storage.files())} files in storage, {len(models)} unit/building/portrait model files '
         f'({time.time() - t0:.1f}s)')
 
     # container summary (always useful to sanity-check the classification)
     summary = {}
     for m in models:
         k = (m.container, m.group, m.label)
-        summary.setdefault(k, {'units': 0, 'buildings': 0})[m.cat] += 1
+        summary.setdefault(k, {'units': 0, 'buildings': 0, 'portraits': 0})[m.cat] += 1
     with open(os.path.join(args.out, '_containers.tsv'), 'w', newline='', encoding='utf-8') as f:
         w = csv.writer(f, delimiter='\t', lineterminator='\n')
-        w.writerow(['container', 'group', 'label', 'unit_files', 'building_files'])
+        w.writerow(['container', 'group', 'label', 'unit_files', 'building_files', 'portrait_files'])
         for (c, g, l), v in sorted(summary.items(), key=lambda kv: (GROUP_ORDER.index(kv[0][1]), kv[0][0])):
-            w.writerow([c, g, l, v['units'], v['buildings']])
-            log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d}')
+            w.writerow([c, g, l, v['units'], v['buildings'], v['portraits']])
+            log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d} '
+                f'portraits={v["portraits"]:5d}')
 
-    n_death, n_anim = nest_unit_folders(models, deaths=not args.flat_deaths, anims=not args.no_extra_anims)
+    n_death, n_anim, n_portrait = nest_unit_folders(models, deaths=not args.flat_deaths,
+                                                    anims=not args.no_extra_anims,
+                                                    portraits=not args.flat_portraits)
     if n_death:
         log(f'Death models: {n_death} folders go in a subfolder of their unit')
     if n_anim:
         log(f'Animation libraries: {n_anim} folders of .m3a files go with the unit they animate')
+    n_pf = len({(m.cat, m.rel.lower().rsplit('/', 1)[0]) for m in models
+                if m.cat == 'portraits' or 'portrait' in m.rel.lower()})
+    if n_pf:
+        log(f'Portraits: {n_portrait} of {n_pf} portrait folders go in a subfolder of their unit')
     if args.classify == 'data':
         log('Sorting models by the game data that uses them ...')
         os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)

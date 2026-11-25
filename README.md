@@ -81,6 +81,15 @@ starts the death folder's name, possibly followed by a state (`fly`, `lowered`, 
 `unpowered`, `hive`...). Death folders of no unit (`ProtossBuildingDeathEx1`, the shared building
 deaths) stay where they are. `--flat-deaths` keeps every death folder at the top level.
 
+### Portraits
+
+The animated unit portraits (the face in the bottom of the game screen) are separate models under
+`Assets/Portraits/<race>/...`. sc2rip files each one in a `portrait` subfolder of its unit: the unit
+or building folder of the same race named like the portrait without "Portrait"
+(`Units/Melee/Terran/Marine/portrait`). A portrait is sorted with its unit. Portraits of no unit
+folder (heroes, advisors...) go to `Portraits/<Melee, Campaign...>/<race>/<name>`, as do all of them
+with `--flat-portraits`. `--categories units,buildings` leaves portraits out.
+
 ### Extra animation libraries
 
 Some folders hold only `.m3a` files: extra animations for a unit made for an expansion, a
@@ -98,7 +107,7 @@ when it finds no model references in the game data.
 
 1. **CASC**: reads the game's storage directly with [CascLib](https://github.com/ladislav-zezula/CascLib)
    (through Python ctypes), or reads files you already extracted with CascView.
-2. **Selection**: takes every `.m3`/`.m3a` under `Assets/Units` and `Assets/Buildings`
+2. **Selection**: takes every `.m3`/`.m3a` under `Assets/Units`, `Assets/Buildings` and `Assets/Portraits`
    (applying SC2's override order between the melee mods), and sorts them by the game data that
    uses them (see "Sorting").
 3. **Textures**: finds every texture each model references, preferring the model's own
@@ -178,7 +187,7 @@ regardless.
 
 | Option | Meaning |
 |---|---|
-| `--categories units,buildings` | what to rip (default: both) |
+| `--categories units,buildings,portraits` | what to rip (default: all three) |
 | `--sources melee,campaign,unused` | which models to rip, by what uses them: add `coop` for Co-op Commander models, `other` for everything else (see "Sorting") |
 | `--classify data\|location` | sort by what uses each model (default) or by where it's stored |
 | `--containers mods/liberty.sc2mod ...` | pick exact containers (overrides `--sources`) |
@@ -206,7 +215,7 @@ python3 sc2rip.py --game "$SC2" --find mothershipcore
 ```
 
 Each line shows the group its container is classified as (`melee`, `campaign`, `coop`, `other`) and
-notes why a model file would be skipped (outside `Assets/Units` / `Assets/Buildings`, or in a
+notes why a model file would be skipped (outside `Assets/Units` / `Assets/Buildings` / `Assets/Portraits`, or in a
 localized package). To see what uses a model, look it up in `_plan.tsv` (`used_by`).
 
 ### Animations
