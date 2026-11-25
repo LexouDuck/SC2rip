@@ -84,11 +84,14 @@ deaths) stay where they are. `--flat-deaths` keeps every death folder at the top
 ### Portraits
 
 The animated unit portraits (the face in the bottom of the game screen) are separate models under
-`Assets/Portraits/<race>/...`. sc2rip files each one in a `portrait` subfolder of its unit: the unit
-or building folder of the same race named like the portrait without "Portrait"
-(`Units/Melee/Terran/Marine/portrait`). A portrait is sorted with its unit. Portraits of no unit
-folder (heroes, advisors...) go to `Portraits/<Melee, Campaign...>/<race>/<name>`, as do all of them
-with `--flat-portraits`. `--categories units,buildings` leaves portraits out.
+`Assets/Portraits/<race>/...`. They get their own hierarchy, `Portraits/<Melee, Campaign...>/<race>/`,
+named after the unit folder they belong to: `MarinePortrait` → `Portraits/Melee/Terran/Marine`,
+`Marine_Silver_Portrait` → `Portraits/Melee/Terran/Marine_Silver`, `Marine1Portrait`...
+`Marine11Portrait` (portrait variations) → also `Portraits/Melee/Terran/Marine`. A portrait matched to a
+unit is sorted with it (Melee, Campaign...). Portraits of no unit folder (heroes, advisors,
+civilians...) are named without "Portrait" (`TychusPortrait` → `Portraits/.../Terran/Tychus`) and
+sorted by the game data that uses them. Their `.m3a` libraries (`TychusPortrait_RequiredAnims`) are
+added to them like the units' ones. `--categories units,buildings` leaves portraits out.
 
 ### Extra animation libraries
 

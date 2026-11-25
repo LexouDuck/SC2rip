@@ -126,7 +126,7 @@ class ModelFile:
         # where the model is filed in the output: by default where it is stored, see classify_by_data()
         self.out_group, self.out_label = self.group, self.label
         self.refs, self.ref_how = None, ''
-        self.nest = None    # (unit folder, subfolder or None, unit category): see nest_unit_folders()
+        self.nest = None    # Nest(...) when filed with/like a unit folder: see nest_unit_folders()
 
 
 TERRAIN_DATA_RE = re.compile(r'^(?P<container>.+?)/base\.sc2data/gamedata/terraintexdata\.xml$')
@@ -379,7 +379,8 @@ def classify_by_data(models, refs, log):
         for m in ms:
             m.out_group, m.out_label = best.out_group, best.out_label
             if not m.ref_how and best.ref_how:
-                m.ref_how = 'unit' if m.nest else 'folder'
+                own = m.rel.lower().split('/')[1:2]
+                m.ref_how = 'unit' if m.nest and (m.nest.ucat, m.nest.unit.lower()) != (m.cat, *own) else 'folder'
     counts, hows = {}, {}
     for m in models:
         if m.ext == 'm3':
@@ -396,7 +397,7 @@ def asset_folder_key(m):
     a unit (see nest_unit_folders) belong to that unit."""
     parts = m.rel.lower().split('/')
     if m.nest:
-        return (m.nest[2], parts[0], m.nest[0].lower())
+        return (m.nest.ucat, m.nest.race.lower(), m.nest.unit.lower())
     return (m.cat, parts[0], parts[1] if len(parts) >= 3 else os.path.splitext(parts[-1])[0])
 
 
@@ -414,59 +415,105 @@ DEATH_STATES = ('', 'empty', 'fly', 'morph', 'unpowered', 'detached', 'open', 'l
                 'acid', 'fire', 'walk', 'physics', 'construction')
 
 
-PORTRAIT_RE = re.compile(r'_?portrait', re.I)
+class Nest(tuple):
+    """Where a model folder is filed instead of its own place: in the output category `out_cat`,
+    under the name of unit folder `unit` (of category `ucat` and race `race`, which it is sorted
+    with), in subfolder `sub` (or directly)."""
+    __slots__ = ()
+    unit = property(lambda t: t[0])
+    sub = property(lambda t: t[1])
+    ucat = property(lambda t: t[2])
+    out_cat = property(lambda t: t[3])
+    race = property(lambda t: t[4])
+
+    def __new__(cls, unit, sub, ucat, out_cat, race):
+        return tuple.__new__(cls, (unit, sub, ucat, out_cat, race))
+
+
+def portrait_name(name):
+    """'MarinePortrait' -> 'Marine', 'Marine_Silver_Portrait' -> 'Marine_Silver',
+    'AdjutantPortrait_L' -> 'Adjutant_L' (case kept)"""
+    return re.sub(r'_+', '_', re.sub(r'(?i)portrait', '_', name)).strip('_') or name
 
 
 def nest_unit_folders(models, deaths=True, anims=True, portraits=True):
-    """Set m.nest = (unit folder, subfolder or None, unit category) for the files of death folders,
-    animation library folders and portrait folders that belong to a unit folder.
-    -> (death folders, animation folders, portrait folders)"""
+    """Set m.nest (see Nest) for the files of
+      - death folders: in a subfolder of their unit (Units/Melee/Terran/Marine/deathacid)
+      - portraits: in Portraits/<group>/<race>/<their unit's folder name> (MarinePortrait ->
+        Portraits/Melee/Terran/Marine), sorted with that unit; with no unit folder, named without
+        "Portrait" (TychusPortrait -> Portraits/.../Terran/Tychus)
+      - animation libraries (.m3a only): with the model they animate
+    -> (death folders, animation folders, portrait folders matched to a unit, portrait folders)"""
     folders, exts = {}, {}      # (cat, race) -> {lowercase folder: original case}; folder -> {ext}
+    races = {}                  # lowercase race -> original case
     for m in models:
         parts = m.rel.split('/')
         if len(parts) >= 3:
             key = (m.cat, parts[0].lower())
+            races.setdefault(parts[0].lower(), parts[0])
             folders.setdefault(key, {}).setdefault(parts[1].lower(), parts[1])
             exts.setdefault(key + (parts[1].lower(),), set()).add(m.ext)
-    nested, n_death, n_anim, n_portrait = {}, 0, 0, 0
+    # unit / building folders with a model, by name without underscores (to match portrait names)
+    unit_index = {}             # (race, squashed name) -> [(cat, name)]
+    for (cat, race), names in folders.items():
+        if cat in ('units', 'buildings'):
+            for name in names:
+                if 'm3' in exts[(cat, race, name)] and 'portrait' not in name:
+                    unit_index.setdefault((race, name.replace('_', '')), []).append((cat, name))
+
+    def find_unit(race, pname):
+        base = pname.lower()
+        tries = [base, re.sub(r'\d+$', '', base)] + [base + x for x in ('ex1', 'ex2', 'ex3')]
+        for t in tries:
+            k = t.replace('_', '')
+            if not k:
+                continue
+            hits = unit_index.get((race, k))
+            if hits:
+                return race, hits[0]
+            other = [(r, h) for (r, kk), hs in unit_index.items() if kk == k for h in hs]
+            if len(other) == 1:
+                return other[0]
+        return None
+
+    nested, libs = {}, {}
+    n_death = n_anim = n_pmatch = n_portrait = 0
     for (cat, race), names in folders.items():
         for name in names:
-            i = name.find('death')
-            if portraits and 'portrait' in name or cat == 'portraits':
-                # portraits: Assets/Portraits/<race>/<name>, or a *Portrait folder among the units
-                # -> the unit (or building) folder of the same race named like it without "portrait"
-                if not portraits or 'm3' not in exts[(cat, race, name)]:
-                    continue
-                unit = PORTRAIT_RE.sub('', name).strip('_')
-                for ucat in ('units', 'buildings'):
-                    unames = folders.get((ucat, race), {})
-                    if unit in unames and (ucat, race, unit) != (cat, race, name) \
-                            and 'm3' in exts[(ucat, race, unit)]:
-                        sub = name[len(unit):].strip('_') if name.startswith(unit) else ''
-                        if 'portrait' not in sub:
-                            sub = 'portrait' + ('_' + sub if sub else '')
-                        nested[(cat, race, name)] = (unames[unit], sub, ucat)
-                        n_portrait += 1
-                        break
-            elif deaths and i > 0:
-                head = name[:i]
+            key = (cat, race, name)
+            has_m3 = 'm3' in exts[key]
+            if anims and exts[key] == {'m3a'}:
+                cands = [p for p in names if p != name and len(p) >= 3 and name.startswith(p)
+                         and 'm3' in exts[(cat, race, p)]]
+                if cands:
+                    libs[key] = (cat, race, max(cands, key=len))
+                    n_anim += 1
+            elif portraits and has_m3 and (cat == 'portraits' or 'portrait' in name):
+                n_portrait += 1
+                pname = portrait_name(names[name])
+                hit = find_unit(race, pname)
+                if hit:
+                    urace, (ucat, unit) = hit
+                    nested[key] = Nest(folders[(ucat, urace)][unit], None, ucat, 'portraits', races[urace])
+                    n_pmatch += 1
+                else:
+                    nested[key] = Nest(pname, None, cat if cat == 'portraits' else 'portraits',
+                                       'portraits', races[race])
+            elif deaths and cat in ('units', 'buildings') and name.find('death') > 0:
+                head = name[:name.find('death')]
                 cands = [p for p in names if p != name and len(p) >= 3 and 'death' not in p
                          and head.startswith(p) and head[len(p):].strip('_') in DEATH_STATES]
                 if cands:
                     parent = max(cands, key=len)
-                    nested[(cat, race, name)] = (names[parent], name[len(parent):].strip('_'), cat)
+                    nested[key] = Nest(names[parent], name[len(parent):].strip('_'), cat, cat, races[race])
                     n_death += 1
-            elif anims and exts[(cat, race, name)] == {'m3a'}:
-                cands = [p for p in names if p != name and len(p) >= 3 and name.startswith(p)
-                         and 'm3' in exts[(cat, race, p)]]
-                if cands:
-                    nested[(cat, race, name)] = (names[max(cands, key=len)], None, cat)
-                    n_anim += 1
+    for key, (cat, race, parent) in libs.items():   # libraries follow the model they animate
+        nested[key] = nested.get((cat, race, parent)) or Nest(folders[(cat, race)][parent], None, cat, cat,
+                                                               races[race])
     for m in models:
         parts = m.rel.split('/')
-        if len(parts) >= 3:
-            m.nest = nested.get((m.cat, parts[0].lower(), parts[1].lower()))
-    return n_death, n_anim, n_portrait
+        m.nest = nested.get((m.cat, parts[0].lower(), parts[1].lower())) if len(parts) >= 3 else None
+    return n_death, n_anim, n_pmatch, n_portrait
 
 
 # --------------------------------------------------------------------------------------
@@ -568,10 +615,11 @@ def folder_for(m):
     stem = os.path.splitext(parts[-1])[0]
     unit = pretty(parts[1], stem) if len(parts) >= 3 else pretty(stem)
     if m.nest:
-        unit = safe(pretty(m.nest[0], stem[:len(m.nest[0])]))
-        if m.nest[1]:
-            unit = os.path.join(unit, safe(m.nest[1].lower()))
-    cat = {'units': 'Units', 'buildings': 'Buildings', 'portraits': 'Portraits'}[m.nest[2] if m.nest else m.cat]
+        race = pretty(m.nest.race)
+        unit = safe(pretty(m.nest.unit, stem[:len(m.nest.unit)]))
+        if m.nest.sub:
+            unit = os.path.join(unit, safe(m.nest.sub.lower()))
+    cat = {'units': 'Units', 'buildings': 'Buildings', 'portraits': 'Portraits'}[m.nest.out_cat if m.nest else m.cat]
     group, label = m.out_group, m.out_label
     if group == 'melee':
         grp = 'Melee'
@@ -843,9 +891,6 @@ def main():
     sel.add_argument('--flat-deaths', action='store_true',
                      help="keep death models in folders of their own (default: in a subfolder of their unit, "
                           "e.g. Units/Melee/Terran/Marine/deathacid)")
-    sel.add_argument('--flat-portraits', action='store_true',
-                     help='keep portrait models in Portraits/... folders of their own (default: in a subfolder '
-                          'of their unit, e.g. Units/Melee/Terran/Marine/portrait)')
     sel.add_argument('--no-extra-anims', action='store_true',
                      help="don't add the animation libraries of other folders (Marine_SwarmAnims, "
                           "Marine_BlackOps_DLC2Anims...) to their unit's model")
@@ -948,17 +993,14 @@ def main():
             log(f'  {g:8s} {c:45s} units={v["units"]:5d} buildings={v["buildings"]:5d} '
                 f'portraits={v["portraits"]:5d}')
 
-    n_death, n_anim, n_portrait = nest_unit_folders(models, deaths=not args.flat_deaths,
-                                                    anims=not args.no_extra_anims,
-                                                    portraits=not args.flat_portraits)
+    n_death, n_anim, n_pmatch, n_portrait = nest_unit_folders(models, deaths=not args.flat_deaths,
+                                                              anims=not args.no_extra_anims)
     if n_death:
         log(f'Death models: {n_death} folders go in a subfolder of their unit')
     if n_anim:
         log(f'Animation libraries: {n_anim} folders of .m3a files go with the unit they animate')
-    n_pf = len({(m.cat, m.rel.lower().rsplit('/', 1)[0]) for m in models
-                if m.cat == 'portraits' or 'portrait' in m.rel.lower()})
-    if n_pf:
-        log(f'Portraits: {n_portrait} of {n_pf} portrait folders go in a subfolder of their unit')
+    if n_portrait:
+        log(f'Portraits: {n_pmatch} of {n_portrait} portrait folders named and sorted after their unit')
     if args.classify == 'data':
         log('Sorting models by the game data that uses them ...')
         os.makedirs(os.path.join(args.out, '_work'), exist_ok=True)
@@ -1137,8 +1179,8 @@ def main():
             if owners:
                 m3a_owner[a.path] = max(owners, key=lambda m: len(m.rel.split('/')[-1]))
             elif a.nest and m3s:    # a library from another folder: the unit's main model
-                main = [m for m in m3s if not m.nest and os.path.splitext(m.rel.split('/')[-1])[0].lower()
-                        == a.nest[0].lower()]
+                main = [m for m in m3s if os.path.splitext(m.rel.split('/')[-1])[0].lower()
+                        == a.nest.unit.lower()]
                 m3a_owner[a.path] = (main or sorted(m3s, key=lambda m: len(m.rel)))[0]
         for m in m3s:
             try:
